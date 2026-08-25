@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beevolve — Signing in</title>
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+<main class="dashboard">
+  <section class="dashboard-card">
+    <div class="eyebrow">Authentication</div>
+    <h1>Completing sign in…</h1>
+    <p id="status">Please wait while we securely finish your sign-in.</p>
+  </section>
+</main>
+<script>
+(async () => {
+  const status = document.getElementById("status");
+  const API_BASE = "http://127.0.0.1:8000";
+
+  try {
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    const accessToken = hash.get("access_token");
+    const refreshToken = hash.get("refresh_token");
+
+    if (!accessToken) {
+      throw new Error("The authentication response did not contain a valid session.");
+    }
+
+    const response = await fetch(API_BASE + "/api/auth/oauth/exchange", {
+      method: "POST",
+      credentials: "include",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        access_token: accessToken,
+        refresh_token: refreshToken
+      })
+    });
+
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || "OAuth sign-in failed.");
+
+    window.history.replaceState({}, document.title, window.location.pathname);
+    window.location.href = "dashboard.html";
+  } catch (error) {
+    status.textContent = error.message || "Unable to complete sign in.";
+  }
+})();
+</script>
+</body>
+</html>
