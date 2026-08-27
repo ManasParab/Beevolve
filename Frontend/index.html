@@ -11,6 +11,14 @@
 </head>
 <body>
 
+<div class="toast-region" aria-live="polite" aria-atomic="true">
+  <div id="auth-message" class="auth-message" role="status" hidden>
+    <span class="toast-icon" aria-hidden="true"></span>
+    <span class="toast-copy"></span>
+    <button class="toast-dismiss" type="button" aria-label="Dismiss notification">&times;</button>
+  </div>
+</div>
+
 <div class="shell">
 
   <!-- LEFT: brand stage -->
@@ -252,8 +260,6 @@
 
         <p class="switch-line">Already have a hive? <a href="#" class="link-amber" data-switch="login">Sign in</a></p>
       </div>
-
-      <div id="auth-message" class="auth-message" role="status" aria-live="polite"></div>
 
       <p class="form-foot-note">Authentication and user data are securely handled by the Beevolve backend.</p>
 

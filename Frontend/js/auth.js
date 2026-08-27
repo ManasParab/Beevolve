@@ -6,12 +6,30 @@
   const API_BASE = "http://127.0.0.1:8000";
   const $ = (id) => document.getElementById(id);
   const messageBox = $("auth-message");
+  const messageCopy = messageBox?.querySelector(".toast-copy");
+  const dismissButton = messageBox?.querySelector(".toast-dismiss");
+  let messageTimer;
 
   function showMessage(message, type = "info") {
     if (!messageBox) return;
-    messageBox.textContent = message;
+    window.clearTimeout(messageTimer);
+    if (!message) {
+      messageBox.hidden = true;
+      return;
+    }
+    if (messageCopy) messageCopy.textContent = message;
     messageBox.className = `auth-message ${type}`;
+    messageBox.setAttribute("role", type === "error" ? "alert" : "status");
+    messageBox.hidden = false;
+    messageTimer = window.setTimeout(() => {
+      messageBox.hidden = true;
+    }, type === "success" ? 7000 : 5000);
   }
+
+  dismissButton?.addEventListener("click", () => {
+    window.clearTimeout(messageTimer);
+    messageBox.hidden = true;
+  });
 
   function setLoading(form, loading, loadingText) {
     const button = form?.querySelector(".btn-primary");
@@ -209,10 +227,18 @@
       );
 
     } catch (error) {
-      showMessage(
-        friendlyError(error),
-        "error"
-      );
+      const errorMessage = String(error?.message || "").toLowerCase();
+      const accountExists = error?.status === 409
+        || errorMessage.includes("already exists")
+        || errorMessage.includes("already registered");
+
+      if (accountExists) {
+        setMode("login");
+        if ($("login-email")) $("login-email").value = email;
+        showMessage("This account already exists. Please log in.", "info");
+      } else {
+        showMessage(friendlyError(error), "error");
+      }
 
     } finally {
       setLoading(

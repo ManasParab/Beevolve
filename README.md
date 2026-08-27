@@ -26,15 +26,23 @@ Open a terminal in:
 
 `Backend`
 
-Activate the virtual environment:
+Create the uv virtual environment and install dependencies:
 
-    venv\Scripts\activate
+    uv venv
+    .\.venv\Scripts\Activate.ps1
+    uv pip install -r requirements.txt
 
-Install dependencies:
+If PowerShell blocks script activation, run this once in PowerShell:
 
-    python -m pip install -r requirements.txt
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+The backend reads Supabase settings from `Backend/.env`. Copy your project URL and anon/publishable key into that file before starting the API.
 
 Start FastAPI:
+
+    uv run uvicorn main:app --reload
+
+You can also start it after activation with:
 
     python -m uvicorn main:app --reload
 
@@ -75,6 +83,8 @@ The backend CORS configuration allows `127.0.0.1:5500` and `localhost:5500`.
 ## Supabase setup
 
 Run `supabase/schema.sql` in Supabase SQL Editor.
+
+To get the values for `Backend/.env`, open your Supabase project at `https://app.supabase.com`, then go to **Project Settings -> API** (or **API Keys** in the newer dashboard). Copy **Project URL** into `SUPABASE_URL`. Copy the client-side **Publishable key** (or legacy **anon** key) into `SUPABASE_ANON_KEY`. Never put the `service_role` or secret key in this project or commit it.
 
 For OAuth, enable Google and Microsoft/Azure providers in Supabase Authentication settings.
 
