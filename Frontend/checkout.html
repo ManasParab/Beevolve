@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Beevolve - Checkout</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <style>
+    .checkout{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0%,rgba(232,163,61,.13),transparent 38%),var(--bg)}
+    .checkout-card{width:min(520px,100%);padding:34px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+    .checkout-card h1{font:600 clamp(36px,7vw,52px)/1.05 'Fraunces',serif;margin:18px 0 12px}.checkout-card p{color:var(--text-muted);line-height:1.65}.checkout-price{font:600 28px 'Fraunces',serif;color:var(--text);margin:24px 0}.checkout-card .btn-primary{margin-top:0}.back-link{display:inline-block;margin-top:20px;color:var(--text-muted);font-size:13px}.back-link:hover{color:var(--amber-light)}
+  </style>
+</head>
+<body>
+  <main class="checkout"><section class="checkout-card">
+    <div class="eyebrow">Secure test checkout</div>
+    <h1 id="service-name">Career Toolkit</h1>
+    <p>Complete your Beevolve purchase in the Razorpay test environment.</p>
+    <div id="service-price" class="checkout-price">Rs. 499</div>
+    <button id="pay-button" class="btn-primary" type="button">Continue to payment <span aria-hidden="true">-&gt;</span></button>
+    <a class="back-link" href="subscriptions.html">&lt;- Back to services</a>
+  </section></main>
+  <script>
+    const API_BASE = "http://127.0.0.1:8000";
+    const SERVICE_PRICES = {"Career Toolkit": 499, "Portfolio Review": 299, "Career Roadmap": 199};
+    const params = new URLSearchParams(window.location.search);
+    const service = params.get("service") || "Career Toolkit";
+    const amount = SERVICE_PRICES[service];
+    const button = document.getElementById("pay-button");
+
+    if (!amount) {
+      document.getElementById("service-name").textContent = "Service unavailable";
+      document.getElementById("service-price").textContent = "Please return to services and choose a valid option.";
+      button.disabled = true;
+    } else {
+      document.getElementById("service-name").textContent = service;
+      document.getElementById("service-price").textContent = `Rs. ${amount}`;
+    }
+
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      button.firstChild.textContent = "Opening checkout... ";
+      try {
+        const response = await fetch(`${API_BASE}/api/payments/create-order`, {method: "POST", credentials: "include", headers: {"Content-Type": "application/json"}, body: JSON.stringify({service})});
+        const order = await response.json();
+        if (!response.ok) throw new Error(order.detail || "Unable to create payment order.");
+        const razorpay = new Razorpay({key: order.key_id, amount: order.amount, currency: order.currency, name: "Beevolve", description: service, order_id: order.id, handler: verifyPayment});
+        razorpay.open();
+      } catch (error) {
+        alert(error.message || "Unable to start payment.");
+        button.disabled = false;
+        button.firstChild.textContent = "Continue to payment ";
+      }
+    });
+
+    async function verifyPayment(payment) {
+      const response = await fetch(`${API_BASE}/api/payments/verify`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payment)});
+      const result = await response.json();
+      alert(result.message);
+      if (result.success) window.location.href = "dashboard.html";
+    }
+  </script>
+</body>
+</html>

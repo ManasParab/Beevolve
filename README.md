@@ -54,11 +54,22 @@ Swagger:
 
     http://127.0.0.1:8000/docs
 
+### Payments
+
+Payment order creation and verification are part of the main backend under
+`/api/payments`. Add the Razorpay test credentials to `Backend/.env` as
+`RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET`. Keep this file private.
+
 ### Frontend
 
 Use VS Code Live Server and open:
 
     http://127.0.0.1:5500/Frontend/index.html
+
+After signing in, open **Explore services** from the dashboard. Each purchase
+button opens the integrated checkout page at:
+
+    http://127.0.0.1:5500/Frontend/checkout.html
 
 The backend CORS configuration allows `127.0.0.1:5500` and `localhost:5500`.
 
@@ -79,6 +90,8 @@ The backend CORS configuration allows `127.0.0.1:5500` and `localhost:5500`.
 - OAuth callback token exchange into HttpOnly cookies
 - Protected dashboard
 - Profile retrieval through FastAPI -> Supabase PostgREST
+- Dashboard service workspace with Resume Builder, Interview Prep and Notes Taker
+- Individual career service checkout through Razorpay test mode
 
 ## Supabase setup
 

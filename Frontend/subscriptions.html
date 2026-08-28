@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Beevolve - Services</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <style>
+    .subscriptions{min-height:100vh;padding:28px clamp(22px,5vw,72px) 64px;background:radial-gradient(circle at 15% 0%,rgba(232,163,61,.1),transparent 30%),var(--bg)}
+    .subscriptions-nav,.subscriptions-main{max-width:1180px;margin:0 auto}.subscriptions-nav{display:flex;justify-content:space-between;align-items:center}.subscriptions-nav a:last-child{font-size:13px;color:var(--text-muted)}.subscriptions-nav a:last-child:hover{color:var(--amber-light)}
+    .subscriptions-main{padding-top:76px}.subscriptions-main h1{font:600 clamp(40px,5vw,68px)/1 'Fraunces',serif;margin:14px 0}.subscriptions-lede{max-width:550px;color:var(--text-muted);line-height:1.7}
+    .plans{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:54px}.plan{display:flex;flex-direction:column;min-height:310px;padding:24px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);transition:transform .2s ease,border-color .2s ease}.plan:hover{transform:translateY(-4px);border-color:var(--amber-deep)}.plan.featured{background:linear-gradient(145deg,rgba(232,163,61,.14),var(--surface) 48%);border-color:var(--amber-deep)}.plan-label{color:var(--amber);font:11px 'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.1em}.plan h2{font:600 28px 'Fraunces',serif;margin:18px 0 10px}.plan p{color:var(--text-muted);font-size:13px;line-height:1.6}.plan-price{margin-top:auto;padding:24px 0 18px;font:600 25px 'Fraunces',serif}.plan-price small{font:12px 'Inter',sans-serif;color:var(--text-faint);font-weight:400}.plan .btn-primary{margin-top:0}.back-home{display:inline-flex;align-items:center;gap:8px;margin-top:28px;color:var(--text-muted);font-size:13px}.back-home:hover{color:var(--amber-light)}
+    @media(max-width:800px){.subscriptions-main{padding-top:58px}.plans{grid-template-columns:1fr;margin-top:38px}.plan{min-height:270px}}
+  </style>
+</head>
+<body>
+  <main class="subscriptions">
+    <nav class="subscriptions-nav">
+      <a class="brand" href="dashboard.html" aria-label="Beevolve home"><span class="brand-mark"><svg viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M20 3 34 11v18l-14 8L6 29V11L20 3Z" stroke="currentColor" stroke-width="2"/><path d="m12 16 8 5 8-5M20 21v9" stroke="currentColor" stroke-width="2"/></svg></span><span class="brand-word">Beevolve</span></a>
+      <a href="dashboard.html">Back to workspace</a>
+    </nav>
+    <section class="subscriptions-main">
+      <div class="eyebrow">Build your career stack</div>
+      <h1>More momentum,<br><em>one service at a time.</em></h1>
+      <p class="subscriptions-lede">Choose the support that fits your next move. Each service is billed individually through the Razorpay sandbox.</p>
+      <div class="plans">
+        <article class="plan featured"><span class="plan-label">Most popular</span><h2>Career Toolkit</h2><p>Resume Builder, Interview Prep, and Notes Taker in one focused workspace.</p><div class="plan-price">Rs. 499 <small>/ one time</small></div><button class="btn-primary buy-service" data-service="Career Toolkit" data-amount="499">Buy toolkit <span aria-hidden="true">-&gt;</span></button></article>
+        <article class="plan"><span class="plan-label">Stand out</span><h2>Portfolio Review</h2><p>Get a sharper portfolio story and a clearer way to present your work.</p><div class="plan-price">Rs. 299 <small>/ one time</small></div><button class="btn-primary buy-service" data-service="Portfolio Review" data-amount="299">Buy service <span aria-hidden="true">-&gt;</span></button></article>
+        <article class="plan"><span class="plan-label">Get clarity</span><h2>Career Roadmap</h2><p>Turn your goals into a practical, next-step plan you can keep moving.</p><div class="plan-price">Rs. 199 <small>/ one time</small></div><button class="btn-primary buy-service" data-service="Career Roadmap" data-amount="199">Buy service <span aria-hidden="true">-&gt;</span></button></article>
+      </div>
+      <a class="back-home" href="dashboard.html">&lt;- Return to your services</a>
+    </section>
+  </main>
+  <script>
+    document.querySelectorAll(".buy-service").forEach(button => button.addEventListener("click", () => {
+      const params = new URLSearchParams({service: button.dataset.service, amount: button.dataset.amount});
+      window.location.href = `checkout.html?${params}`;
+    }));
+  </script>
+</body>
+</html>

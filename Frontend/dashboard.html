@@ -3,29 +3,56 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Beevolve — Dashboard</title>
+  <title>Beevolve — Your workspace</title>
   <link rel="stylesheet" href="css/styles.css">
   <style>
-    .dashboard{min-height:100vh;display:grid;place-items:center;padding:30px}
-    .dashboard-card{width:min(560px,100%);background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:36px;box-shadow:0 24px 80px rgba(0,0,0,.35)}
-    .dashboard-card h1{font-family:'Fraunces',serif;font-size:38px;margin:12px 0}
-    .dashboard-card p{color:var(--text-muted);line-height:1.7}
-    .profile{margin:24px 0;padding:18px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
-    .profile-row{display:flex;justify-content:space-between;gap:20px;padding:9px 0;border-bottom:1px solid var(--border-soft)}
-    .profile-row:last-child{border-bottom:0}
-    .profile-row span:first-child{color:var(--text-faint)}
-    .profile-row span:last-child{word-break:break-word}
+    .dashboard{--sidebar-width:270px;min-height:100vh;padding:24px clamp(20px,4vw,64px) 42px calc(var(--sidebar-width) + clamp(28px,5vw,72px));background:radial-gradient(circle at 85% 0%,rgba(232,163,61,.12),transparent 30%),var(--bg);transition:padding-left .25s ease}
+    .dashboard.sidebar-collapsed{--sidebar-width:58px}
+    .dashboard-nav{max-width:1240px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;gap:24px}
+    .dashboard-actions{display:flex;align-items:center;gap:14px;color:var(--text-muted);font-size:13px}
+    .explore-link{position:relative;display:flex;align-items:center;gap:9px;padding:10px 15px;border:1px solid var(--amber-deep);border-radius:9px;background:rgba(232,163,61,.12);color:var(--amber-light);font-weight:700;box-shadow:0 0 24px rgba(232,163,61,.1)}
+    .explore-link:hover{background:var(--amber);color:#17120c;transform:translateY(-1px)}
+    .new-badge{padding:3px 5px;border-radius:4px;background:var(--amber);color:#17120c;font:700 9px 'IBM Plex Mono',monospace;letter-spacing:.08em}
+    .logout{border:1px solid var(--border);border-radius:8px;padding:9px 14px;background:var(--surface);color:var(--text-muted);cursor:pointer;font:inherit}.logout:hover{border-color:var(--amber-deep);color:var(--text)}
+    .dashboard-layout{max-width:1240px;margin:58px auto 0}.profile-sidebar{position:fixed;z-index:10;inset:0 auto 0 0;width:270px;padding:28px 20px;background:rgba(16,13,10,.98);border-right:1px solid var(--border);box-shadow:16px 0 36px rgba(0,0,0,.18);transition:width .25s ease;overflow:hidden}.sidebar-toggle{position:absolute;z-index:2;top:24px;right:-1px;width:31px;height:31px;border:1px solid var(--border);border-right:0;border-radius:8px 0 0 8px;background:var(--surface-2);color:var(--amber-light);cursor:pointer;font-size:17px;line-height:1}.sidebar-toggle:hover{background:var(--amber);color:#17120c}.sidebar-content{padding-top:30px;transition:opacity .15s ease}.dashboard.sidebar-collapsed .profile-sidebar{width:58px;padding-left:12px;padding-right:12px}.dashboard.sidebar-collapsed .sidebar-content{opacity:0;pointer-events:none}.dashboard.sidebar-collapsed .sidebar-toggle{right:13px;border:1px solid var(--border);border-radius:8px}.dashboard.sidebar-collapsed .sidebar-toggle span{display:inline-block;transform:rotate(180deg)}
+    .avatar{display:grid;place-items:center;width:58px;height:58px;margin-bottom:18px;border-radius:50%;background:var(--amber);color:#17120c;font:600 25px 'Fraunces',serif}
+    .profile-sidebar h2{font:600 22px 'Fraunces',serif;overflow-wrap:anywhere}.profile-sidebar .profile{margin-top:24px}.profile{display:grid;gap:14px}.profile-row{display:grid;gap:4px;padding:10px 0;border-bottom:1px solid var(--border-soft)}.profile-row:last-child{border-bottom:0}.profile-row span:first-child{color:var(--text-faint);font:10px 'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.08em}.profile-row span:last-child{word-break:break-word;font-size:13px}.profile-note{margin-top:18px;color:var(--text-faint);font-size:11px;line-height:1.6}.sidebar-divider{height:1px;margin:24px 0 18px;background:var(--border)}
+    .dashboard-main{min-width:0}.dashboard-card h1{font-family:'Fraunces',serif;font-size:clamp(40px,5vw,68px);line-height:1;margin:14px 0 16px}.dashboard-intro{color:var(--text-muted);line-height:1.7;max-width:560px}.services-heading{display:flex;justify-content:space-between;align-items:baseline;gap:16px;margin:52px 0 18px}.services-heading h2{font:600 27px 'Fraunces',serif}.services-heading span{font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.1em}
+    .service-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.service-item{display:flex;flex-direction:column;align-items:flex-start;min-height:190px;padding:20px;border:1px solid var(--border);background:linear-gradient(145deg,rgba(28,23,16,.95),var(--surface));border-radius:12px;transition:transform .2s ease,border-color .2s ease}.service-item:hover{transform:translateY(-4px);border-color:var(--amber-deep)}.service-icon{display:grid;place-items:center;width:40px;height:40px;margin-bottom:24px;border-radius:10px;background:rgba(232,163,61,.13);color:var(--amber);font:600 18px 'Fraunces',serif}.service-item strong{display:block;font:600 18px 'Fraunces',serif}.service-item small{display:block;color:var(--text-faint);margin-top:7px;font-size:11px;line-height:1.5}.service-status{margin-top:auto;color:var(--success);font:10px 'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.07em}
+    @media(max-width:900px){.service-list{grid-template-columns:1fr}.service-item{min-height:145px}.service-icon{margin-bottom:16px}}
+    @media(max-width:680px){.dashboard{padding:20px 20px 38px}.dashboard-layout{margin-top:48px}.profile-sidebar{width:min(290px,calc(100vw - 32px));box-shadow:18px 0 42px rgba(0,0,0,.42)}.dashboard.sidebar-collapsed .profile-sidebar{width:58px}.dashboard-actions{gap:8px}.explore-link{padding:9px 11px}.services-heading{margin-top:42px}}
   </style>
 </head>
 <body>
   <main class="dashboard">
-    <section class="dashboard-card">
-      <div class="eyebrow">Authenticated</div>
-      <h1>Welcome to Beevolve.</h1>
-      <p>You are successfully signed in. Your session is protected by the Beevolve backend.</p>
-      <div id="profile" class="profile">Loading profile…</div>
-      <button id="logout" class="btn-primary" type="button">Sign out</button>
-    </section>
+    <nav class="dashboard-nav">
+      <a class="brand" href="dashboard.html" aria-label="Beevolve home"><span class="brand-mark"><svg viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M20 3 34 11v18l-14 8L6 29V11L20 3Z" stroke="currentColor" stroke-width="2"/><path d="m12 16 8 5 8-5M20 21v9" stroke="currentColor" stroke-width="2"/></svg></span><span class="brand-word">Beevolve</span></a>
+      <div class="dashboard-actions"><a class="explore-link" href="subscriptions.html"><span class="new-badge">NEW</span> Explore services <span aria-hidden="true">-&gt;</span></a></div>
+    </nav>
+    <div class="dashboard-layout">
+      <aside class="profile-sidebar">
+        <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Collapse profile sidebar" aria-expanded="true"><span aria-hidden="true">&lt;</span></button>
+        <div class="sidebar-content">
+          <div id="avatar" class="avatar" aria-hidden="true">B</div>
+          <div class="eyebrow">Account</div>
+          <h2 id="sidebar-name">Your profile</h2>
+          <div id="profile" class="profile">Loading profile...</div>
+          <p class="profile-note">Your details are securely retrieved from your Beevolve account.</p>
+          <div class="sidebar-divider"></div>
+          <button id="sidebar-logout" class="logout" type="button">Sign out</button>
+        </div>
+      </aside>
+      <div class="dashboard-main">
+        <div class="eyebrow">Your career workspace</div>
+        <section class="dashboard-card"><h1>Welcome back<span id="welcome-name">.</span></h1><p class="dashboard-intro">Your tools are ready. Pick up where you left off or add another service to your career plan.</p></section>
+        <div class="services-heading"><h2>Your services</h2><span>3 active services</span></div>
+        <div class="service-list">
+          <article class="service-item"><div class="service-icon">R</div><strong>Resume Builder</strong><small>Build a resume that gets noticed.</small><span class="service-status">Active</span></article>
+          <article class="service-item"><div class="service-icon">I</div><strong>Interview Prep</strong><small>Practice with focused preparation.</small><span class="service-status">Active</span></article>
+          <article class="service-item"><div class="service-icon">N</div><strong>Notes Taker</strong><small>Keep your career thinking in one place.</small><span class="service-status">Active</span></article>
+        </div>
+      </div>
+    </div>
   </main>
 
   <script>
@@ -68,6 +95,10 @@
         } catch (_) {}
 
         const metadata = auth.user?.user_metadata || {};
+        const displayName = profile?.full_name || metadata.full_name || "";
+        document.getElementById("welcome-name").textContent = displayName ? `, ${displayName.split(" ")[0]}.` : ".";
+        document.getElementById("sidebar-name").textContent = displayName || "Your profile";
+        document.getElementById("avatar").textContent = (displayName || "B").charAt(0).toUpperCase();
 
         profileEl.innerHTML = `
           <div class="profile-row"><span>Name</span><span>${escapeHtml(profile?.full_name || metadata.full_name || "—")}</span></div>
@@ -79,12 +110,20 @@
       }
     })();
 
-    document.getElementById("logout").addEventListener("click", async () => {
+    async function logout() {
       try {
         await api("/api/auth/logout", {method: "POST"});
       } finally {
         window.location.href = "index.html";
       }
+    }
+    document.getElementById("sidebar-logout").addEventListener("click", logout);
+    const dashboard = document.querySelector(".dashboard");
+    const sidebarToggle = document.getElementById("sidebar-toggle");
+    sidebarToggle.addEventListener("click", () => {
+      const collapsed = dashboard.classList.toggle("sidebar-collapsed");
+      sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+      sidebarToggle.setAttribute("aria-label", collapsed ? "Open profile sidebar" : "Collapse profile sidebar");
     });
   </script>
 </body>
