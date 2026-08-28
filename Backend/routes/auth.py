@@ -6,7 +6,8 @@ from pydantic import BaseModel, EmailStr
 
 from supabase_client import (
     SUPABASE_URL,
-    SUPABASE_ANON_KEY,
+    SUPABASE_PUBLISHABLE_KEY,
+    SUPABASE_SECRET_KEY,
     supabase_request,
     supabase_rest_request,
 )
