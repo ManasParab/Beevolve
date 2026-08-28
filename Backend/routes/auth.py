@@ -59,45 +59,74 @@ def friendly_supabase_error(payload: dict, fallback: str):
 
 @router.post("/register")
 async def register_user(data: RegisterRequest, response: Response):
+
     payload = {
-    "email": data.email,
-    "password": data.password,
-    "data": {
-        "full_name": data.name,
-        "mobile": data.mobile,
-    },
-    "options": {
-        "email_redirect_to": f"{FRONTEND_URL}/index.html"
-    },
-}
+        "email": data.email,
+        "password": data.password,
+        "data": {
+            "full_name": data.name,
+            "mobile": data.mobile,
+        },
+        "options": {
+            "email_redirect_to": f"{FRONTEND_URL}/index.html"
+        },
+    }
 
     supa = await supabase_request("POST", "signup", json=payload)
 
     try:
         body = supa.json()
+        print("SUPABASE SIGNUP RESPONSE:", body)
     except Exception:
         body = {}
 
+    # Supabase returned an actual error
     if supa.status_code >= 400:
-        message = friendly_supabase_error(body, "Registration failed.")
+        message = friendly_supabase_error(
+            body,
+            "Registration failed."
+        )
+
         if "already registered" in message.lower():
             message = "An account with this email already exists. Please sign in."
-        raise HTTPException(status_code=400, detail=message)
 
+        raise HTTPException(
+            status_code=400,
+            detail=message
+        )
+
+    # Get user information
     user = body.get("user") or {}
     identities = user.get("identities")
 
-    # Supabase can return an existing confirmed user with an empty identities list
-    # when email enumeration protection is enabled.
+    print("USER:", user)
+    print("IDENTITIES:", identities)
+
+    # No user returned.
+    # This can happen when the email already exists
+    # and Supabase email-enumeration protection is enabled.
+    if not user:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists. Please sign in."
+        )
+
+    # Existing account
     if identities == []:
         raise HTTPException(
             status_code=409,
-            detail="An account with this email already exists. Please sign in.",
+            detail="An account with this email already exists. Please sign in."
         )
 
+    # Get session
     session = body.get("session") or {}
+
     if session.get("access_token"):
-        set_session_cookies(response, session["access_token"], session.get("refresh_token"))
+        set_session_cookies(
+            response,
+            session["access_token"],
+            session.get("refresh_token")
+        )
 
     return {
         "success": True,
