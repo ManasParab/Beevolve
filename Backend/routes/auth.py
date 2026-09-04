@@ -4,6 +4,8 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
 
+from twilio.base.exceptions import TwilioRestException
+
 from supabase_client import (
     SUPABASE_URL,
     SUPABASE_PUBLISHABLE_KEY,
@@ -11,6 +13,7 @@ from supabase_client import (
     supabase_request,
     supabase_rest_request,
 )
+from twilio_client import twilio_client, TWILIO_VERIFY_SERVICE_SID
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
@@ -49,6 +52,18 @@ class UpdateProfileRequest(BaseModel):
     mobile: str = ""
     email: EmailStr
 
+class SendOtpRequest(BaseModel):
+    mobile: str
+
+class VerifyOtpRequest(BaseModel):
+    mobile: str
+    code: str
+    user_id: str
+    email: EmailStr
+
+class SendEmailVerificationRequest(BaseModel):
+    email: EmailStr
+
 def set_session_cookies(response: Response, access_token: str, refresh_token: str | None):
     response.set_cookie("beevolve_access", access_token, max_age=3600, **COOKIE_KWARGS)
     if refresh_token:
@@ -65,82 +80,175 @@ def friendly_supabase_error(payload: dict, fallback: str):
 @router.post("/register")
 async def register_user(data: RegisterRequest, response: Response):
 
+    # Create the user via the ADMIN API instead of the public /signup endpoint.
+    # This does NOT send any email automatically, and gives us a clean,
+    # honest error if the email is genuinely already registered (no more
+    # guessing based on an empty "identities" list).
     payload = {
         "email": data.email,
         "password": data.password,
-        "data": {
+        "email_confirm": False,
+        "phone_confirm": False,
+        "user_metadata": {
             "full_name": data.name,
             "mobile": data.mobile,
         },
-        "options": {
-            "email_redirect_to": f"{FRONTEND_URL}/index.html"
-        },
     }
 
-    supa = await supabase_request("POST", "signup", json=payload)
+    supa = await supabase_request(
+        "POST",
+        "admin/users",
+        json=payload,
+        access_token=SUPABASE_SECRET_KEY,
+    )
 
     try:
         body = supa.json()
-        print("SUPABASE SIGNUP RESPONSE:", body)
+        print("SUPABASE CREATE USER RESPONSE:", body)
     except Exception:
         body = {}
 
-    # Supabase returned an actual error
     if supa.status_code >= 400:
-        message = friendly_supabase_error(
-            body,
-            "Registration failed."
-        )
+        message = friendly_supabase_error(body, "Registration failed.")
 
-        if "already registered" in message.lower():
+        if "already" in message.lower() and "registered" in message.lower():
+            message = "An account with this email already exists. Please sign in."
+        elif "already" in message.lower() and "exists" in message.lower():
             message = "An account with this email already exists. Please sign in."
 
+        raise HTTPException(status_code=400, detail=message)
+
+    user = body or {}
+    if not user.get("id"):
+        raise HTTPException(status_code=400, detail="Registration failed. Please try again.")
+
+    return {
+        "success": True,
+        "message": "Account created. Choose how you'd like to verify your account.",
+        "authenticated": False,
+        "user_id": user.get("id"),
+    }
+
+
+@router.post("/send-verification-email")
+async def send_verification_email(data: SendEmailVerificationRequest):
+    """Sends Supabase's standard 'Confirm your signup' email — only called
+    when the user explicitly clicks 'Verify with email'."""
+    resp = await supabase_request(
+        "POST",
+        "resend",
+        json={
+            "type": "signup",
+            "email": str(data.email),
+            "options": {"email_redirect_to": f"{FRONTEND_URL}/index.html"},
+        },
+    )
+
+    if resp.status_code >= 400:
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
         raise HTTPException(
             status_code=400,
-            detail=message
+            detail=friendly_supabase_error(body, "Unable to send the verification email."),
         )
 
-    # Get user information
-    user = body.get("user") or {}
-    identities = user.get("identities")
+    return {"success": True, "message": "Verification email sent."}
 
-    print("USER:", user)
-    print("IDENTITIES:", identities)
-
-    # No user returned.
-    # This can happen when the email already exists
-    # and Supabase email-enumeration protection is enabled.
-    if not user:
+@router.post("/otp/send")
+async def send_otp(data: SendOtpRequest):
+    """Sends a one-time code to the given mobile number using Twilio Verify."""
+    print("OTP SEND ATTEMPT -> mobile:", repr(data.mobile), "| service sid:", repr(TWILIO_VERIFY_SERVICE_SID))
+    try:
+        verification = twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID) \
+            .verifications.create(to=data.mobile, channel="sms")
+    except TwilioRestException as e:
+        print("TWILIO ERROR -> status:", e.status, "| code:", e.code, "| msg:", e.msg, "| more_info:", e.uri)
         raise HTTPException(
-            status_code=409,
-            detail="An account with this email already exists. Please sign in."
-        )
-
-    # Existing account
-    if identities == []:
-        raise HTTPException(
-            status_code=409,
-            detail="An account with this email already exists. Please sign in."
-        )
-
-    # Get session
-    session = body.get("session") or {}
-
-    if session.get("access_token"):
-        set_session_cookies(
-            response,
-            session["access_token"],
-            session.get("refresh_token")
+            status_code=400,
+            detail=f"[{e.code}] {e.msg}" if e.msg else "Unable to send the OTP. Please check the mobile number.",
         )
 
     return {
         "success": True,
-        "message": (
-            "Account created. Please check your email for verification."
-            if not session.get("access_token")
-            else "Account created successfully."
-        ),
-        "authenticated": bool(session.get("access_token")),
+        "status": verification.status,
+        "message": "We've sent a code to your mobile number.",
+    }
+
+
+@router.post("/otp/verify")
+async def verify_otp(data: VerifyOtpRequest, response: Response):
+    """Checks the OTP with Twilio, then confirms + logs the user into Supabase."""
+
+    print("OTP VERIFY ATTEMPT -> mobile:", repr(data.mobile), "| code:", repr(data.code), "| user_id:", repr(data.user_id), "| email:", repr(data.email))
+
+    # 1) Ask Twilio if the code the user typed is correct.
+    try:
+        check = twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID) \
+            .verification_checks.create(to=data.mobile, code=data.code)
+    except TwilioRestException as e:
+        print("STEP 1 (twilio check) FAILED -> status:", e.status, "| code:", e.code, "| msg:", e.msg)
+        raise HTTPException(
+            status_code=400,
+            detail=f"[{e.code}] {e.msg}" if e.msg else "Unable to verify the code. Please try again.",
+        )
+
+    print("STEP 1 (twilio check) OK -> status:", check.status)
+
+    if check.status != "approved":
+        raise HTTPException(status_code=400, detail="Incorrect or expired code. Please try again.")
+
+    # 2) Code was correct -> mark this Supabase user as verified (email + phone).
+    confirm = await supabase_request(
+        "PUT",
+        f"admin/users/{data.user_id}",
+        json={"email_confirm": True, "phone": data.mobile, "phone_confirm": True},
+        access_token=SUPABASE_SECRET_KEY,
+    )
+    print("STEP 2 (confirm user) -> status:", confirm.status_code, "| body:", confirm.text)
+    if confirm.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Step 2 failed [{confirm.status_code}]: {confirm.text}")
+
+    # 3) Generate a one-time login link for this user (server-side only, never shown to them)...
+    link = await supabase_request(
+        "POST",
+        "admin/generate_link",
+        json={"type": "magiclink", "email": str(data.email)},
+        access_token=SUPABASE_SECRET_KEY,
+    )
+    print("STEP 3 (generate_link) -> status:", link.status_code, "| body:", link.text)
+    if link.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Step 3 failed [{link.status_code}]: {link.text}")
+
+    link_body = link.json()
+    token_hash = (link_body.get("properties") or {}).get("hashed_token") or link_body.get("hashed_token")
+    print("STEP 3 token_hash found:", bool(token_hash))
+    if not token_hash:
+        raise HTTPException(status_code=400, detail="Step 3 failed: no hashed_token in generate_link response.")
+
+    # ...and immediately redeem it for a real session (access + refresh tokens).
+    session = await supabase_request(
+        "POST",
+        "verify",
+        json={"type": "magiclink", "token_hash": token_hash},
+    )
+    print("STEP 4 (redeem token) -> status:", session.status_code, "| body:", session.text)
+    if session.status_code >= 400:
+        raise HTTPException(status_code=400, detail=f"Step 4 failed [{session.status_code}]: {session.text}")
+
+    session_body = session.json()
+    access_token = session_body.get("access_token")
+    refresh_token = session_body.get("refresh_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Step 4 failed: no access_token in verify response.")
+
+    # 4) Log them in exactly like /login does.
+    set_session_cookies(response, access_token, refresh_token)
+    return {
+        "success": True,
+        "authenticated": True,
+        "message": "Mobile number verified successfully.",
     }
 
 @router.post("/login")

@@ -44,8 +44,13 @@
     }
   }
 
-  function normalizeMobile(value) {
-    return value.replace(/[^\d+]/g, "").trim();
+    function normalizeMobile(value) {
+    let cleaned = value.replace(/[^\d+]/g, "").trim();
+    // If they didn't type a country code, assume India (+91).
+    if (cleaned && !cleaned.startsWith("+")) {
+      cleaned = "+91" + cleaned;
+    }
+    return cleaned;
   }
 
   function validatePassword(password) {
@@ -99,19 +104,119 @@
   const tabBtns = tabs ? tabs.querySelectorAll(".tab-btn") : [];
   const panelLogin = $("panel-login");
   const panelRegister = $("panel-register");
+  const panelVerify = $("panel-verify");
   const loginForm = $("login-form");
   const registerForm = $("register-form");
 
   function setMode(mode) {
     const isRegister = mode === "register";
-    if (tabs) tabs.classList.toggle("mode-register", isRegister);
+    if (tabs) {
+      tabs.style.display = "";
+      tabs.classList.toggle("mode-register", isRegister);
+    }
     tabBtns.forEach(b => b.classList.toggle("active", b.dataset.tab === mode));
     if (panelLogin) panelLogin.style.display = isRegister ? "none" : "block";
     if (panelRegister) panelRegister.style.display = isRegister ? "block" : "none";
+    if (panelVerify) panelVerify.style.display = "none";
     if (loginForm) loginForm.classList.toggle("active", !isRegister);
     if (registerForm) registerForm.classList.toggle("active", isRegister);
     showMessage("");
   }
+
+  // ------------------------------------------------------------
+  // Verification step (shown right after a successful registration)
+  // ------------------------------------------------------------
+  const verifyChoiceEmailBtn = $("verify-choice-email");
+  const verifyChoiceMobileBtn = $("verify-choice-mobile");
+  const mobileOtpBox = $("mobile-otp-box");
+  const otpCodeInput = $("otp-code");
+  const otpVerifyBtn = $("otp-verify-btn");
+  const otpResendLink = $("otp-resend");
+
+  let pendingSignup = { userId: null, email: null, mobile: null };
+
+  function showVerifyPanel({ userId, email, mobile }) {
+    pendingSignup = { userId, email, mobile };
+    if (tabs) tabs.style.display = "none";
+    if (panelLogin) panelLogin.style.display = "none";
+    if (panelRegister) panelRegister.style.display = "none";
+    if (panelVerify) panelVerify.style.display = "block";
+    if (mobileOtpBox) mobileOtpBox.style.display = "none";
+    if (otpCodeInput) otpCodeInput.value = "";
+    showMessage("");
+  }
+
+    verifyChoiceEmailBtn?.addEventListener("click", async () => {
+    if (!pendingSignup.email) return;
+    try {
+      verifyChoiceEmailBtn.disabled = true;
+      await api("/api/auth/send-verification-email", {
+        method: "POST",
+        body: JSON.stringify({ email: pendingSignup.email })
+      });
+      if (mobileOtpBox) mobileOtpBox.style.display = "none";
+      showMessage("Check your email to verify your account!", "success");
+    } catch (error) {
+      showMessage(friendlyError(error), "error");
+    } finally {
+      verifyChoiceEmailBtn.disabled = false;
+    }
+  });
+
+  async function sendMobileOtp() {
+    if (!pendingSignup.mobile) return;
+    try {
+      verifyChoiceMobileBtn.disabled = true;
+      await api("/api/auth/otp/send", {
+        method: "POST",
+        body: JSON.stringify({ mobile: pendingSignup.mobile })
+      });
+      if (mobileOtpBox) mobileOtpBox.style.display = "block";
+      showMessage(`We've sent a code to ${pendingSignup.mobile}.`, "success");
+      otpCodeInput?.focus();
+    } catch (error) {
+      showMessage(friendlyError(error), "error");
+    } finally {
+      verifyChoiceMobileBtn.disabled = false;
+    }
+  }
+
+  verifyChoiceMobileBtn?.addEventListener("click", sendMobileOtp);
+  otpResendLink?.addEventListener("click", (e) => {
+    e.preventDefault();
+    sendMobileOtp();
+  });
+
+  otpVerifyBtn?.addEventListener("click", async () => {
+    const code = otpCodeInput?.value.trim();
+    if (!code) return showMessage("Please enter the code we sent you.", "error");
+    if (!pendingSignup.userId || !pendingSignup.email) {
+      return showMessage("Something went wrong. Please register again.", "error");
+    }
+
+    const originalText = otpVerifyBtn.innerHTML;
+    otpVerifyBtn.disabled = true;
+    otpVerifyBtn.innerHTML = "Verifying…";
+
+    try {
+      await api("/api/auth/otp/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          mobile: pendingSignup.mobile,
+          code,
+          user_id: pendingSignup.userId,
+          email: pendingSignup.email
+        })
+      });
+      showMessage("Mobile number verified! Redirecting…", "success");
+      window.location.href = "dashboard.html";
+    } catch (error) {
+      showMessage(friendlyError(error), "error");
+    } finally {
+      otpVerifyBtn.disabled = false;
+      otpVerifyBtn.innerHTML = originalText;
+    }
+  });
 
   if (panelRegister) panelRegister.style.display = "none";
   tabBtns.forEach(btn => btn.addEventListener("click", () => setMode(btn.dataset.tab)));
@@ -212,19 +317,13 @@
         })
       });
 
-      // First switch to Login
-      setMode("login");
-
-      // Automatically fill the registered email
+      // Automatically fill the registered email (used if they end up back on Login)
       if ($("login-email")) {
         $("login-email").value = email;
       }
 
-      // Show success message after switching to Login
-      showMessage(
-        "Account created successfully! Please check your email to verify your account before logging in.",
-        "success"
-      );
+      // Let the user pick how they want to verify: email or mobile OTP.
+      showVerifyPanel({ userId: result.user_id, email, mobile });
 
     } catch (error) {
       const errorMessage = String(error?.message || "").toLowerCase();

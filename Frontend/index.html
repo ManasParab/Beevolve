@@ -258,11 +258,44 @@
           </button>
         </div>
 
-        <p class="switch-line">Already have a hive? <a href="#" class="link-amber" data-switch="login">Sign in</a></p>
+               <p class="switch-line">Already have a hive? <a href="#" class="link-amber" data-switch="login">Sign in</a></p>
+      </div>
+
+      <!-- VERIFY -->
+      <div id="panel-verify" style="display:none;">
+        <div class="headline">
+          <div class="eyebrow">Almost there</div>
+          <h2>Verify your account</h2>
+          <p>Choose how you'd like to verify your new account.</p>
+        </div>
+
+        <div id="verify-choice-row" class="social-row" style="grid-template-columns:1fr;">
+          <button class="social-btn" type="button" id="verify-choice-email">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h13A2.5 2.5 0 0 1 21 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5v-11Z"/><path d="m3.5 6 8 6.5 8-6.5"/></svg>
+            Verify with email
+          </button>
+          <button class="social-btn" type="button" id="verify-choice-mobile">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6.5" y="3" width="11" height="18" rx="2"/><path d="M10 18h4"/></svg>
+            Verify with mobile number
+          </button>
+        </div>
+
+        <div id="mobile-otp-box" style="display:none; margin-top:18px;">
+          <div class="field">
+            <label for="otp-code">Enter the code sent to your mobile</label>
+            <div class="input-wrap">
+              <input type="text" id="otp-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6">
+            </div>
+            <div class="hint">Didn't get it? <a href="#" class="link-amber" id="otp-resend">Resend code</a></div>
+          </div>
+          <button type="button" class="btn-primary" id="otp-verify-btn">
+            Verify &amp; continue
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+          </button>
+        </div>
       </div>
 
       <p class="form-foot-note">Authentication and user data are securely handled by the Beevolve backend.</p>
-
     </div>
   </div>
 
