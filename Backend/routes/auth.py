@@ -44,6 +44,11 @@ class OAuthExchangeRequest(BaseModel):
 class UpdatePasswordRequest(BaseModel):
     password: str
 
+class UpdateProfileRequest(BaseModel):
+    full_name: str
+    mobile: str = ""
+    email: EmailStr
+
 def set_session_cookies(response: Response, access_token: str, refresh_token: str | None):
     response.set_cookie("beevolve_access", access_token, max_age=3600, **COOKIE_KWARGS)
     if refresh_token:
@@ -324,6 +329,41 @@ async def profile(request: Request):
 
     rows = supa.json()
     return {"profile": rows[0] if rows else None}
+
+@router.put("/profile")
+async def update_profile(data: UpdateProfileRequest, request: Request):
+    access_token = request.cookies.get("beevolve_access")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    user_id = await _user_id(access_token)
+    auth_update = await supabase_request(
+        "PUT",
+        "user",
+        json={
+            "email": str(data.email),
+            "data": {"full_name": data.full_name, "mobile": data.mobile},
+        },
+        access_token=access_token,
+    )
+    if auth_update.status_code >= 400:
+        try:
+            body = auth_update.json()
+        except Exception:
+            body = {}
+        raise HTTPException(status_code=400, detail=friendly_supabase_error(body, "Unable to update account details."))
+
+    profile_update = await supabase_rest_request(
+        "PATCH",
+        "profiles",
+        json={"full_name": data.full_name, "mobile": data.mobile},
+        access_token=access_token,
+        params={"id": "eq." + user_id},
+    )
+    if profile_update.status_code >= 400:
+        raise HTTPException(status_code=profile_update.status_code, detail="Unable to update profile.")
+
+    return {"success": True, "message": "Profile updated successfully. Check your email if confirmation is required."}
 
 async def _user_id(access_token: str) -> str:
     supa = await supabase_request("GET", "user", access_token=access_token)
