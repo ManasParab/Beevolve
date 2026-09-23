@@ -1,10 +1,15 @@
 import os
+import re
+import secrets
+import hashlib
+import hmac
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
-
-from twilio.base.exceptions import TwilioRestException
 
 from supabase_client import (
     SUPABASE_URL,
@@ -13,12 +18,45 @@ from supabase_client import (
     supabase_request,
     supabase_rest_request,
 )
-from twilio_client import twilio_client, TWILIO_VERIFY_SERVICE_SID
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://127.0.0.1:5500/Frontend").rstrip("/")
+
+# ============================================================
+# EMAIL OTP SETTINGS
+# ============================================================
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME or "")
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Beevolve")
+
+EMAIL_OTP_EXPIRY_MINUTES = int(
+    os.getenv("EMAIL_OTP_EXPIRY_MINUTES", "5")
+)
+
+EMAIL_OTP_MAX_ATTEMPTS = int(
+    os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5")
+)
+
+EMAIL_OTP_RESEND_SECONDS = int(
+    os.getenv("EMAIL_OTP_RESEND_SECONDS", "60")
+)
+
+EMAIL_OTP_PEPPER = os.getenv("EMAIL_OTP_PEPPER")
+
+if not SMTP_USERNAME:
+    print("WARNING: SMTP_USERNAME is missing from .env")
+
+if not SMTP_PASSWORD:
+    print("WARNING: SMTP_PASSWORD is missing from .env")
+
+if not EMAIL_OTP_PEPPER:
+    print("WARNING: EMAIL_OTP_PEPPER is missing from .env")
 
 COOKIE_KWARGS = {
     "httponly": True,
@@ -52,17 +90,14 @@ class UpdateProfileRequest(BaseModel):
     mobile: str = ""
     email: EmailStr
 
-class SendOtpRequest(BaseModel):
-    mobile: str
-
-class VerifyOtpRequest(BaseModel):
-    mobile: str
-    code: str
+class SendEmailOtpRequest(BaseModel):
+    email: EmailStr
     user_id: str
-    email: EmailStr
 
-class SendEmailVerificationRequest(BaseModel):
+class VerifyEmailOtpRequest(BaseModel):
     email: EmailStr
+    user_id: str
+    code: str
 
 def set_session_cookies(response: Response, access_token: str, refresh_token: str | None):
     response.set_cookie("beevolve_access", access_token, max_age=3600, **COOKIE_KWARGS)
@@ -76,6 +111,85 @@ def clear_session_cookies(response: Response):
 def friendly_supabase_error(payload: dict, fallback: str):
     message = payload.get("msg") or payload.get("message") or payload.get("error_description") or payload.get("error")
     return message or fallback
+
+# ============================================================
+# EMAIL OTP HELPERS
+# ============================================================
+
+def generate_email_otp() -> str:
+    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    numbers = "23456789"
+
+    # Guarantee at least 1 letter and 1 number
+    otp = [
+        secrets.choice(letters),
+        secrets.choice(numbers)
+    ]
+
+    # Fill remaining 4 characters
+    alphabet = letters + numbers
+    otp.extend(secrets.choice(alphabet) for _ in range(4))
+
+    # Shuffle so the number isn't always in position 2
+    secrets.SystemRandom().shuffle(otp)
+
+    return "".join(otp)
+
+
+def hash_email_otp(otp: str) -> str:
+    """
+    Hash the OTP before storing it in the database.
+    """
+    if not EMAIL_OTP_PEPPER:
+        raise RuntimeError("EMAIL_OTP_PEPPER is missing from .env")
+
+    normalized = otp.strip().upper()
+
+    return hashlib.sha256(
+        f"{EMAIL_OTP_PEPPER}:{normalized}".encode("utf-8")
+    ).hexdigest()
+
+
+def send_email_otp_message(to_email: str, otp: str):
+    """
+    Sends the OTP through Gmail SMTP.
+    """
+
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        raise RuntimeError("Gmail SMTP credentials are missing.")
+
+    message = EmailMessage()
+
+    message["Subject"] = "Beevolve email verification code"
+    message["From"] = (
+        f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+        if SMTP_FROM_EMAIL
+        else SMTP_USERNAME
+    )
+    message["To"] = to_email
+
+    message.set_content(
+        f"""Hi,
+
+Your Beevolve email verification code is:
+
+{otp}
+
+This code will expire in {EMAIL_OTP_EXPIRY_MINUTES} minutes.
+
+If you did not create a Beevolve account, you can safely ignore this email.
+
+Regards,
+Beevolve Team
+"""
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(message)
 
 @router.post("/register")
 async def register_user(data: RegisterRequest, response: Response):
@@ -123,132 +237,357 @@ async def register_user(data: RegisterRequest, response: Response):
         raise HTTPException(status_code=400, detail="Registration failed. Please try again.")
 
     return {
-        "success": True,
-        "message": "Account created. Choose how you'd like to verify your account.",
-        "authenticated": False,
-        "user_id": user.get("id"),
-    }
+    "success": True,
+    "message": "Account created. Please verify your email.",
+    "authenticated": False,
+    "user_id": user.get("id"),
+}
 
+# ============================================================
+# SEND EMAIL OTP
+# ============================================================
 
-@router.post("/send-verification-email")
-async def send_verification_email(data: SendEmailVerificationRequest):
-    """Sends Supabase's standard 'Confirm your signup' email — only called
-    when the user explicitly clicks 'Verify with email'."""
-    resp = await supabase_request(
-        "POST",
-        "resend",
-        json={
-            "type": "signup",
-            "email": str(data.email),
-            "options": {"email_redirect_to": f"{FRONTEND_URL}/index.html"},
+@router.post("/email-otp/send")
+async def send_email_otp(data: SendEmailOtpRequest):
+
+    email = str(data.email).strip().lower()
+    user_id = data.user_id.strip()
+
+    # --------------------------------------------------------
+    # Check that this user actually exists
+    # --------------------------------------------------------
+
+    user_resp = await supabase_request(
+        "GET",
+        f"admin/users/{user_id}",
+        access_token=SUPABASE_SECRET_KEY,
+    )
+
+    if user_resp.status_code >= 400:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid registration session. Please create your account again.",
+        )
+
+    try:
+        user = user_resp.json()
+    except Exception:
+        user = {}
+
+    if str(user.get("email", "")).lower() != email:
+        raise HTTPException(
+            status_code=400,
+            detail="Email does not match the registered account.",
+        )
+
+    if user.get("email_confirmed_at"):
+        raise HTTPException(
+            status_code=400,
+            detail="This email is already verified.",
+        )
+
+    # --------------------------------------------------------
+    # Check resend cooldown
+    # --------------------------------------------------------
+
+    existing = await supabase_rest_request(
+        "GET",
+        "email_otps",
+        params={
+            "select": "created_at",
+            "user_id": f"eq.{user_id}",
+            "order": "created_at.desc",
+            "limit": "1",
         },
+        access_token=SUPABASE_SECRET_KEY,
     )
 
-    if resp.status_code >= 400:
+    if existing.status_code < 400:
         try:
-            body = resp.json()
+            rows = existing.json()
         except Exception:
-            body = {}
-        raise HTTPException(
-            status_code=400,
-            detail=friendly_supabase_error(body, "Unable to send the verification email."),
+            rows = []
+
+        if rows:
+            created_at = datetime.fromisoformat(
+                rows[0]["created_at"].replace("Z", "+00:00")
+            )
+
+            elapsed = (
+                datetime.now(timezone.utc) - created_at
+            ).total_seconds()
+
+            if elapsed < EMAIL_OTP_RESEND_SECONDS:
+                remaining = int(
+                    EMAIL_OTP_RESEND_SECONDS - elapsed
+                )
+
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Please wait {remaining} seconds before requesting another code.",
+                )
+
+    # --------------------------------------------------------
+    # Generate OTP
+    # --------------------------------------------------------
+
+    otp = generate_email_otp()
+    otp_hash = hash_email_otp(otp)
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=EMAIL_OTP_EXPIRY_MINUTES)
+    )
+
+    # --------------------------------------------------------
+    # Delete previous OTPs for this user
+    # --------------------------------------------------------
+
+    await supabase_rest_request(
+        "DELETE",
+        "email_otps",
+        params={
+            "user_id": f"eq.{user_id}",
+        },
+        access_token=SUPABASE_SECRET_KEY,
+    )
+
+    # --------------------------------------------------------
+    # Store new OTP
+    # --------------------------------------------------------
+
+    stored = await supabase_rest_request(
+        "POST",
+        "email_otps",
+        json={
+            "user_id": user_id,
+            "email": email,
+            "otp_hash": otp_hash,
+            "expires_at": expires_at.isoformat(),
+            "attempts": 0,
+        },
+        access_token=SUPABASE_SECRET_KEY,
+    )
+
+    if stored.status_code >= 400:
+        print(
+            "EMAIL OTP DB ERROR:",
+            stored.status_code,
+            stored.text,
         )
 
-    return {"success": True, "message": "Verification email sent."}
-
-@router.post("/otp/send")
-async def send_otp(data: SendOtpRequest):
-    """Sends a one-time code to the given mobile number using Twilio Verify."""
-    print("OTP SEND ATTEMPT -> mobile:", repr(data.mobile), "| service sid:", repr(TWILIO_VERIFY_SERVICE_SID))
-    try:
-        verification = twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID) \
-            .verifications.create(to=data.mobile, channel="sms")
-    except TwilioRestException as e:
-        print("TWILIO ERROR -> status:", e.status, "| code:", e.code, "| msg:", e.msg, "| more_info:", e.uri)
         raise HTTPException(
-            status_code=400,
-            detail=f"[{e.code}] {e.msg}" if e.msg else "Unable to send the OTP. Please check the mobile number.",
+            status_code=500,
+            detail="Unable to create the verification code.",
+        )
+
+    # --------------------------------------------------------
+    # Send email
+    # --------------------------------------------------------
+
+    try:
+        send_email_otp_message(email, otp)
+
+    except Exception as exc:
+        print("EMAIL OTP SEND ERROR:", repr(exc))
+
+        # Do not leave a valid OTP behind if email sending failed.
+        await supabase_rest_request(
+            "DELETE",
+            "email_otps",
+            params={
+                "user_id": f"eq.{user_id}",
+            },
+            access_token=SUPABASE_SECRET_KEY,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to send the verification email. Please try again.",
         )
 
     return {
         "success": True,
-        "status": verification.status,
-        "message": "We've sent a code to your mobile number.",
+        "message": "A 6-character verification code has been sent to your email.",
     }
 
+# ============================================================
+# VERIFY EMAIL OTP
+# ============================================================
 
-@router.post("/otp/verify")
-async def verify_otp(data: VerifyOtpRequest, response: Response):
-    """Checks the OTP with Twilio, then confirms + logs the user into Supabase."""
+@router.post("/email-otp/verify")
+async def verify_email_otp(
+    data: VerifyEmailOtpRequest,
+    response: Response,
+):
 
-    print("OTP VERIFY ATTEMPT -> mobile:", repr(data.mobile), "| code:", repr(data.code), "| user_id:", repr(data.user_id), "| email:", repr(data.email))
+    email = str(data.email).strip().lower()
+    user_id = data.user_id.strip()
+    code = data.code.strip().upper()
 
-    # 1) Ask Twilio if the code the user typed is correct.
-    try:
-        check = twilio_client.verify.v2.services(TWILIO_VERIFY_SERVICE_SID) \
-            .verification_checks.create(to=data.mobile, code=data.code)
-    except TwilioRestException as e:
-        print("STEP 1 (twilio check) FAILED -> status:", e.status, "| code:", e.code, "| msg:", e.msg)
+    # --------------------------------------------------------
+    # Basic OTP validation
+    # --------------------------------------------------------
+
+    if not re.fullmatch(r"[A-Z0-9]{6}", code):
         raise HTTPException(
             status_code=400,
-            detail=f"[{e.code}] {e.msg}" if e.msg else "Unable to verify the code. Please try again.",
+            detail="Please enter the 6-character verification code.",
         )
 
-    print("STEP 1 (twilio check) OK -> status:", check.status)
+    # --------------------------------------------------------
+    # Get latest OTP
+    # --------------------------------------------------------
 
-    if check.status != "approved":
-        raise HTTPException(status_code=400, detail="Incorrect or expired code. Please try again.")
+    otp_resp = await supabase_rest_request(
+        "GET",
+        "email_otps",
+        params={
+            "select": "id,email,otp_hash,expires_at,attempts",
+            "user_id": f"eq.{user_id}",
+            "email": f"eq.{email}",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+        access_token=SUPABASE_SECRET_KEY,
+    )
 
-    # 2) Code was correct -> mark this Supabase user as verified (email + phone).
-    confirm = await supabase_request(
+    if otp_resp.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to verify the code right now.",
+        )
+
+    try:
+        rows = otp_resp.json()
+    except Exception:
+        rows = []
+
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No active verification code found. Please request a new code.",
+        )
+
+    otp_record = rows[0]
+
+    # --------------------------------------------------------
+    # Check expiry
+    # --------------------------------------------------------
+
+    expires_at = datetime.fromisoformat(
+        otp_record["expires_at"].replace("Z", "+00:00")
+    )
+
+    if datetime.now(timezone.utc) > expires_at:
+
+        await supabase_rest_request(
+            "DELETE",
+            "email_otps",
+            params={
+                "id": f"eq.{otp_record['id']}",
+            },
+            access_token=SUPABASE_SECRET_KEY,
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail="This verification code has expired. Please request a new one.",
+        )
+
+    # --------------------------------------------------------
+    # Check attempts
+    # --------------------------------------------------------
+
+    attempts = int(otp_record.get("attempts", 0))
+
+    if attempts >= EMAIL_OTP_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Too many incorrect attempts. Please request a new code.",
+        )
+
+    # --------------------------------------------------------
+    # Compare hashed OTP
+    # --------------------------------------------------------
+
+    supplied_hash = hash_email_otp(code)
+
+    if not hmac.compare_digest(
+        supplied_hash,
+        otp_record["otp_hash"],
+    ):
+
+        await supabase_rest_request(
+            "PATCH",
+            "email_otps",
+            json={
+                "attempts": attempts + 1,
+            },
+            params={
+                "id": f"eq.{otp_record['id']}",
+            },
+            access_token=SUPABASE_SECRET_KEY,
+        )
+
+        remaining = EMAIL_OTP_MAX_ATTEMPTS - attempts - 1
+
+        if remaining <= 0:
+            message = "Too many incorrect attempts. Please request a new code."
+        else:
+            message = f"Incorrect verification code. {remaining} attempts remaining."
+
+        raise HTTPException(
+            status_code=400,
+            detail=message,
+        )
+
+    # --------------------------------------------------------
+    # OTP correct → confirm email
+    # --------------------------------------------------------
+
+    confirm_resp = await supabase_request(
         "PUT",
-        f"admin/users/{data.user_id}",
-        json={"email_confirm": True, "phone": data.mobile, "phone_confirm": True},
+        f"admin/users/{user_id}",
+        json={
+            "email_confirm": True,
+        },
         access_token=SUPABASE_SECRET_KEY,
     )
-    print("STEP 2 (confirm user) -> status:", confirm.status_code, "| body:", confirm.text)
-    if confirm.status_code >= 400:
-        raise HTTPException(status_code=400, detail=f"Step 2 failed [{confirm.status_code}]: {confirm.text}")
 
-    # 3) Generate a one-time login link for this user (server-side only, never shown to them)...
-    link = await supabase_request(
-        "POST",
-        "admin/generate_link",
-        json={"type": "magiclink", "email": str(data.email)},
+    if confirm_resp.status_code >= 400:
+        print(
+            "EMAIL CONFIRM ERROR:",
+            confirm_resp.status_code,
+            confirm_resp.text,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="OTP was correct, but the email could not be verified.",
+        )
+
+    # --------------------------------------------------------
+    # Delete used OTP
+    # --------------------------------------------------------
+
+    await supabase_rest_request(
+        "DELETE",
+        "email_otps",
+        params={
+            "id": f"eq.{otp_record['id']}",
+        },
         access_token=SUPABASE_SECRET_KEY,
     )
-    print("STEP 3 (generate_link) -> status:", link.status_code, "| body:", link.text)
-    if link.status_code >= 400:
-        raise HTTPException(status_code=400, detail=f"Step 3 failed [{link.status_code}]: {link.text}")
 
-    link_body = link.json()
-    token_hash = (link_body.get("properties") or {}).get("hashed_token") or link_body.get("hashed_token")
-    print("STEP 3 token_hash found:", bool(token_hash))
-    if not token_hash:
-        raise HTTPException(status_code=400, detail="Step 3 failed: no hashed_token in generate_link response.")
+    # We intentionally do NOT try to login here using a password.
+    # The frontend will send the user to the normal login screen.
+    # --------------------------------------------------------
 
-    # ...and immediately redeem it for a real session (access + refresh tokens).
-    session = await supabase_request(
-        "POST",
-        "verify",
-        json={"type": "magiclink", "token_hash": token_hash},
-    )
-    print("STEP 4 (redeem token) -> status:", session.status_code, "| body:", session.text)
-    if session.status_code >= 400:
-        raise HTTPException(status_code=400, detail=f"Step 4 failed [{session.status_code}]: {session.text}")
-
-    session_body = session.json()
-    access_token = session_body.get("access_token")
-    refresh_token = session_body.get("refresh_token")
-    if not access_token:
-        raise HTTPException(status_code=400, detail="Step 4 failed: no access_token in verify response.")
-
-    # 4) Log them in exactly like /login does.
-    set_session_cookies(response, access_token, refresh_token)
     return {
         "success": True,
-        "authenticated": True,
-        "message": "Mobile number verified successfully.",
+        "authenticated": False,
+        "message": "Email verified successfully. You can now sign in.",
     }
 
 @router.post("/login")

@@ -4,4 +4,3 @@ httpx>=0.27
 python-dotenv>=1.0
 pydantic[email]>=2.0
 razorpay>=2.0
-twilio>=9.0
