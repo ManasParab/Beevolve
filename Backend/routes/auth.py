@@ -70,6 +70,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     mobile: str
     password: str
+    terms_accepted: bool
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -194,10 +195,16 @@ Beevolve Team
 @router.post("/register")
 async def register_user(data: RegisterRequest, response: Response):
 
+    # Check Terms & Conditions acceptance
+    if not data.terms_accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="Please accept the Terms & Conditions and Privacy Policy."
+        )
+
     # Create the user via the ADMIN API instead of the public /signup endpoint.
     # This does NOT send any email automatically, and gives us a clean,
-    # honest error if the email is genuinely already registered (no more
-    # guessing based on an empty "identities" list).
+    # honest error if the email is genuinely already registered.
     payload = {
         "email": data.email,
         "password": data.password,
@@ -233,15 +240,19 @@ async def register_user(data: RegisterRequest, response: Response):
         raise HTTPException(status_code=400, detail=message)
 
     user = body or {}
+
     if not user.get("id"):
-        raise HTTPException(status_code=400, detail="Registration failed. Please try again.")
+        raise HTTPException(
+            status_code=400,
+            detail="Registration failed. Please try again."
+        )
 
     return {
-    "success": True,
-    "message": "Account created. Please verify your email.",
-    "authenticated": False,
-    "user_id": user.get("id"),
-}
+        "success": True,
+        "message": "Account created. Please verify your email.",
+        "authenticated": False,
+        "user_id": user.get("id"),
+    }
 
 # ============================================================
 # SEND EMAIL OTP
@@ -292,7 +303,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
 
     existing = await supabase_rest_request(
         "GET",
-        "email_otps",
+        "otp_verification",
         params={
             "select": "created_at",
             "user_id": f"eq.{user_id}",
@@ -345,7 +356,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
 
     await supabase_rest_request(
         "DELETE",
-        "email_otps",
+        "otp_verification",
         params={
             "user_id": f"eq.{user_id}",
         },
@@ -358,7 +369,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
 
     stored = await supabase_rest_request(
         "POST",
-        "email_otps",
+        "otp_verification",
         json={
             "user_id": user_id,
             "email": email,
@@ -394,7 +405,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
         # Do not leave a valid OTP behind if email sending failed.
         await supabase_rest_request(
             "DELETE",
-            "email_otps",
+            "otp_verification",
             params={
                 "user_id": f"eq.{user_id}",
             },
@@ -441,7 +452,7 @@ async def verify_email_otp(
 
     otp_resp = await supabase_rest_request(
         "GET",
-        "email_otps",
+        "otp_verification",
         params={
             "select": "id,email,otp_hash,expires_at,attempts",
             "user_id": f"eq.{user_id}",
@@ -483,7 +494,7 @@ async def verify_email_otp(
 
         await supabase_rest_request(
             "DELETE",
-            "email_otps",
+            "otp_verification",
             params={
                 "id": f"eq.{otp_record['id']}",
             },
@@ -520,7 +531,7 @@ async def verify_email_otp(
 
         await supabase_rest_request(
             "PATCH",
-            "email_otps",
+            "otp_verification",
             json={
                 "attempts": attempts + 1,
             },
@@ -573,7 +584,7 @@ async def verify_email_otp(
 
     await supabase_rest_request(
         "DELETE",
-        "email_otps",
+        "otp_verification",
         params={
             "id": f"eq.{otp_record['id']}",
         },

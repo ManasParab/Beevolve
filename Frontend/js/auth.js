@@ -90,24 +90,21 @@
   // MOBILE NORMALIZATION
   // ============================================================
 
-  function normalizeMobile(value) {
+ function normalizeMobile(value) {
+  let cleaned = value
+    .replace(/[^\d+]/g, "")
+    .trim();
 
-    let cleaned = value
-      .replace(/[^\d+]/g, "")
-      .trim();
-
-    // If they didn't type a country code,
-    // assume India (+91).
-    if (
-      cleaned &&
-      !cleaned.startsWith("+")
-    ) {
-      cleaned = "+91" + cleaned;
-    }
-
-    return cleaned;
+  if (cleaned.startsWith("+91")) {
+    cleaned = cleaned.slice(3);
+  } else if (cleaned.startsWith("91") && cleaned.length > 10) {
+    cleaned = cleaned.slice(2);
   }
 
+  cleaned = cleaned.replace(/\D/g, "").slice(0, 10);
+
+  return "+91" + cleaned;
+  }
 
   // ============================================================
   // PASSWORD VALIDATION
@@ -1140,12 +1137,9 @@
           ?.value || "";
 
 
-      const terms =
-        registerForm
-          .querySelector(
-            'input[type="checkbox"][required]'
-          )
-          ?.checked;
+      const terms = registerForm.querySelector(
+      'input[type="checkbox"]'
+      )?.checked;
 
 
       // --------------------------------------------------------
@@ -1216,13 +1210,11 @@
 
 
       if (!terms) {
-
-        return showMessage(
-          "Please accept the terms and privacy policy.",
-          "error"
+      return showMessage(
+      "Please accept the terms and privacy policy.",
+      "error"
         );
       }
-
 
       // --------------------------------------------------------
       // Create account
@@ -1245,15 +1237,11 @@
               method: "POST",
 
               body: JSON.stringify({
-
                 name,
-
                 email,
-
                 mobile,
-
-                password
-
+                password,
+                terms_accepted: true,
               })
 
             }
