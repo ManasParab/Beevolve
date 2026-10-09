@@ -80,3 +80,11 @@ async def supabase_rest_request(
         )
 
     return response
+
+
+async def supabase_rpc(name: str, payload: dict):
+    return await supabase_rest_request(
+        "POST",
+        f"rpc/{name}",
+        json=payload
+    )

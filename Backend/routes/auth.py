@@ -301,17 +301,20 @@ async def send_email_otp(data: SendEmailOtpRequest):
     # Check resend cooldown
     # --------------------------------------------------------
 
+    
     existing = await supabase_rest_request(
         "GET",
-        "otp_verification",
+        "otp_verifications",
         params={
-            "select": "created_at",
+            "select": "created_date",
             "user_id": f"eq.{user_id}",
-            "order": "created_at.desc",
+            "purpose": "eq.email_verification",
+            "order": "created_date.desc",
             "limit": "1",
         },
         access_token=SUPABASE_SECRET_KEY,
     )
+
 
     if existing.status_code < 400:
         try:
@@ -321,7 +324,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
 
         if rows:
             created_at = datetime.fromisoformat(
-                rows[0]["created_at"].replace("Z", "+00:00")
+                rows[0]["created_date"].replace("Z", "+00:00")
             )
 
             elapsed = (
@@ -356,7 +359,7 @@ async def send_email_otp(data: SendEmailOtpRequest):
 
     await supabase_rest_request(
         "DELETE",
-        "otp_verification",
+        "otp_verifications",
         params={
             "user_id": f"eq.{user_id}",
         },
@@ -367,18 +370,20 @@ async def send_email_otp(data: SendEmailOtpRequest):
     # Store new OTP
     # --------------------------------------------------------
 
+    
     stored = await supabase_rest_request(
         "POST",
-        "otp_verification",
+        "otp_verifications",
         json={
             "user_id": user_id,
-            "email": email,
             "otp_hash": otp_hash,
+            "purpose": "email_verification",
             "expires_at": expires_at.isoformat(),
             "attempts": 0,
         },
         access_token=SUPABASE_SECRET_KEY,
     )
+
 
     if stored.status_code >= 400:
         print(
@@ -403,14 +408,17 @@ async def send_email_otp(data: SendEmailOtpRequest):
         print("EMAIL OTP SEND ERROR:", repr(exc))
 
         # Do not leave a valid OTP behind if email sending failed.
+        
         await supabase_rest_request(
-            "DELETE",
-            "otp_verification",
-            params={
-                "user_id": f"eq.{user_id}",
-            },
-            access_token=SUPABASE_SECRET_KEY,
+        "DELETE",
+        "otp_verifications",
+        params={
+            "user_id": f"eq.{user_id}",
+            "purpose": "eq.email_verification",
+        },
+        access_token=SUPABASE_SECRET_KEY,
         )
+
 
         raise HTTPException(
             status_code=500,
@@ -450,18 +458,20 @@ async def verify_email_otp(
     # Get latest OTP
     # --------------------------------------------------------
 
+    
     otp_resp = await supabase_rest_request(
         "GET",
-        "otp_verification",
+        "otp_verifications",
         params={
-            "select": "id,email,otp_hash,expires_at,attempts",
+            "select": "id,otp_hash,expires_at,attempts",
             "user_id": f"eq.{user_id}",
-            "email": f"eq.{email}",
-            "order": "created_at.desc",
+            "purpose": "eq.email_verification",
+            "order": "created_date.desc",
             "limit": "1",
         },
         access_token=SUPABASE_SECRET_KEY,
     )
+
 
     if otp_resp.status_code >= 400:
         raise HTTPException(
@@ -494,7 +504,7 @@ async def verify_email_otp(
 
         await supabase_rest_request(
             "DELETE",
-            "otp_verification",
+            "otp_verifications",
             params={
                 "id": f"eq.{otp_record['id']}",
             },
@@ -531,7 +541,7 @@ async def verify_email_otp(
 
         await supabase_rest_request(
             "PATCH",
-            "otp_verification",
+            "otp_verifications",
             json={
                 "attempts": attempts + 1,
             },
@@ -584,7 +594,7 @@ async def verify_email_otp(
 
     await supabase_rest_request(
         "DELETE",
-        "otp_verification",
+        "otp_verifications",
         params={
             "id": f"eq.{otp_record['id']}",
         },
@@ -771,14 +781,13 @@ async def profile(request: Request):
     if not access_token:
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    supa = await supabase_rest_request(
-        "GET",
-        "profiles",
-        access_token=access_token,
-        params={
-            "select": "id,full_name,mobile,created_at,updated_at",
-            "id": "eq." + (await _user_id(access_token)),
-            "limit": "1",
+    supa = await supabase_rest_request( 
+    "users",
+    access_token=access_token,
+    params={
+        "select": "id,email,full_name,mobile,created_at:created_date,updated_at:updated_date",
+        "id": "eq." + (await _user_id(access_token)),
+        "limit": "1",
         },
     )
 
@@ -811,13 +820,18 @@ async def update_profile(data: UpdateProfileRequest, request: Request):
             body = {}
         raise HTTPException(status_code=400, detail=friendly_supabase_error(body, "Unable to update account details."))
 
+    
     profile_update = await supabase_rest_request(
         "PATCH",
-        "profiles",
-        json={"full_name": data.full_name, "mobile": data.mobile},
+        "users",
+        json={
+            "full_name": data.full_name,
+            "mobile": data.mobile,
+        },
         access_token=access_token,
         params={"id": "eq." + user_id},
     )
+
     if profile_update.status_code >= 400:
         raise HTTPException(status_code=profile_update.status_code, detail="Unable to update profile.")
 
