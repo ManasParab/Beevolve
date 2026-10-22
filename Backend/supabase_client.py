@@ -2,6 +2,11 @@ import os
 import httpx
 from dotenv import load_dotenv
 
+import logging
+from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -70,16 +75,32 @@ async def supabase_rest_request(
     if extra_headers:
         headers.update(extra_headers)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.request(
-            method,
-            f"{REST_URL}/{path.lstrip('/')}",
-            headers=headers,
-            json=json,
-            params=params,
-        )
+    
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.request(
+                method,
+                f"{REST_URL}/{path.lstrip('/')}",
+                headers=headers,
+                json=json,
+                params=params,
+            )
+        return response
 
-    return response
+    except httpx.TimeoutException as exc:
+        logger.exception("Supabase request timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="The database service timed out.",
+        ) from exc
+
+    except httpx.RequestError as exc:
+        logger.exception("Unable to connect to Supabase")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to communicate with the database service.",
+        ) from exc
+
 
 
 async def supabase_rpc(name: str, payload: dict):

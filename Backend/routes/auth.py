@@ -781,15 +781,18 @@ async def profile(request: Request):
     if not access_token:
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    supa = await supabase_rest_request( 
+    
+    supa = await supabase_rest_request(
+    "GET",
     "users",
     access_token=access_token,
     params={
         "select": "id,email,full_name,mobile,created_at:created_date,updated_at:updated_date",
         "id": "eq." + (await _user_id(access_token)),
         "limit": "1",
-        },
+      },
     )
+
 
     if supa.status_code >= 400:
         raise HTTPException(status_code=supa.status_code, detail="Unable to load profile.")

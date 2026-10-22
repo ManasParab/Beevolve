@@ -55,7 +55,12 @@
     });
 
     async function verifyPayment(payment) {
-      const response = await fetch(`${API_BASE}/api/payments/verify`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payment)});
+      const response = await fetch(`${API_BASE}/api/payments/verify`, {
+      method: "POST",
+      credentials: "include",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payment)
+    });
       const result = await response.json();
       alert(result.message);
       if (result.success) window.location.href = "dashboard.html";

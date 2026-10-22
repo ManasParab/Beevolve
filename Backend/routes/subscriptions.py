@@ -7,6 +7,8 @@
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
+from uuid import UUID
 
 import razorpay
 from fastapi import APIRouter, HTTPException, Request
@@ -45,13 +47,19 @@ def check_response(response, message):
             response.status_code,
             response.text,
         )
-        raise HTTPException(status_code=500, detail=message)
+        raise HTTPException(
+            status_code=500,
+            detail=message,
+        )
 
     try:
         return response.json()
-    except Exception:
-        return []
-
+    except ValueError:
+        logger.exception("%s: Invalid JSON response", message)
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid response from the database service.",
+        )
 
 async def get_authenticated_user(request: Request) -> str:
     token = request.cookies.get("beevolve_access")
@@ -199,3 +207,60 @@ async def get_my_subscriptions(request: Request):
     )
 
     return {"subscriptions": subscriptions}
+
+    
+@router.get("/access/{product_id}")
+async def check_product_access(
+    product_id: UUID,
+    request: Request,
+):
+    user_id = await get_authenticated_user(request)
+
+    response = await supabase_rest_request(
+        "GET",
+        "subscriptions",
+        params={
+            "select": "id,subscription_status,starts_at,expires_at",
+            "user_id": f"eq.{user_id}",
+            "product_id": f"eq.{product_id}",
+            "subscription_status": "eq.active",
+            "status": "eq.active",
+        },
+    )
+
+    records = check_response(
+        response,
+        "Unable to verify product access.",
+    )
+
+    now = datetime.now(timezone.utc)
+
+    for record in records:
+        starts_at = record.get("starts_at")
+        expires_at = record.get("expires_at")
+
+        if starts_at:
+            start = datetime.fromisoformat(
+                starts_at.replace("Z", "+00:00")
+            )
+            if start > now:
+                continue
+
+        if expires_at:
+            expiry = datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            )
+            if expiry <= now:
+                continue
+
+        return {
+            "has_access": True,
+            "product_id": str(product_id),
+            "message": "Access granted.",
+        }
+
+    return {
+        "has_access": False,
+        "product_id": str(product_id),
+        "message": "An active purchase is required to access this service.",
+    }
