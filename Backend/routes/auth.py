@@ -4,6 +4,7 @@ import secrets
 import hashlib
 import hmac
 import smtplib
+import time
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -18,6 +19,16 @@ from supabase_client import (
     supabase_request,
     supabase_rest_request,
 )
+
+# Login attempt protection
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 10 * 60
+
+_login_attempts = {}
+
+def get_login_key(request: Request, email: str) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    return f"{client_ip}:{email.strip().lower()}"
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
@@ -202,6 +213,20 @@ async def register_user(data: RegisterRequest, response: Response):
             detail="Please accept the Terms & Conditions and Privacy Policy."
         )
 
+    # Validate Indian mobile number
+    mobile = re.sub(r"\D", "", data.mobile or "")
+
+    if mobile.startswith("0091") and len(mobile) == 14:
+     mobile = mobile[4:]
+    elif mobile.startswith("91") and len(mobile) == 12:
+     mobile = mobile[2:]
+
+    if not re.fullmatch(r"[6-9]\d{9}", mobile):
+     raise HTTPException(
+        status_code=400,
+        detail="Please enter a valid 10-digit Indian mobile number."
+    )
+
     # Create the user via the ADMIN API instead of the public /signup endpoint.
     # This does NOT send any email automatically, and gives us a clean,
     # honest error if the email is genuinely already registered.
@@ -212,7 +237,7 @@ async def register_user(data: RegisterRequest, response: Response):
         "phone_confirm": False,
         "user_metadata": {
             "full_name": data.name,
-            "mobile": data.mobile,
+           "mobile": "+91" + mobile,
         },
     }
 
@@ -611,12 +636,39 @@ async def verify_email_otp(
         "message": "Email verified successfully. You can now sign in.",
     }
 
+
 @router.post("/login")
-async def login_user(data: LoginRequest, response: Response):
+async def login_user(
+    data: LoginRequest,
+    request: Request,
+    response: Response,
+):
+    key = get_login_key(request, str(data.email))
+    now = time.time()
+
+    record = _login_attempts.get(
+        key,
+        {"count": 0, "locked_until": 0},
+    )
+
+    if now < record["locked_until"]:
+        remaining = int(record["locked_until"] - now)
+        minutes = max(1, (remaining + 59) // 60)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {minutes} minute(s).",
+        )
+
+    if record["locked_until"] and now >= record["locked_until"]:
+        record = {"count": 0, "locked_until": 0}
+
     supa = await supabase_request(
         "POST",
         "token?grant_type=password",
-        json={"email": data.email, "password": data.password},
+        json={
+            "email": data.email,
+            "password": data.password,
+        },
     )
 
     try:
@@ -625,18 +677,44 @@ async def login_user(data: LoginRequest, response: Response):
         body = {}
 
     if supa.status_code >= 400:
-        message = friendly_supabase_error(body, "Invalid email or password.")
+        message = friendly_supabase_error(
+            body,
+            "Invalid email or password.",
+        )
         lower = message.lower()
+
         if "email not confirmed" in lower:
             message = "Please verify your email before signing in."
         elif "invalid login credentials" in lower:
             message = "Incorrect email or password."
+
+        # Count failed password attempts.
+        if "email not confirmed" not in lower:
+            record["count"] += 1
+
+            if record["count"] >= LOGIN_MAX_ATTEMPTS:
+                record["locked_until"] = (
+                    time.time() + LOGIN_LOCKOUT_SECONDS
+                )
+
+            _login_attempts[key] = record
+
+            if record["count"] >= LOGIN_MAX_ATTEMPTS:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed attempts. Try again in 10 minutes.",
+                )
+
         raise HTTPException(status_code=401, detail=message)
 
     access_token = body.get("access_token")
     refresh_token = body.get("refresh_token")
+
     if not access_token:
         raise HTTPException(status_code=401, detail="Login failed.")
+
+    # Clear the counter after a successful login.
+    _login_attempts.pop(key, None)
 
     set_session_cookies(response, access_token, refresh_token)
 
@@ -701,9 +779,11 @@ async def logout(request: Request, response: Response):
 async def forgot_password(data: ForgotPasswordRequest):
     redirect_to = f"{FRONTEND_URL}/reset-password.html"
     supa = await supabase_request(
-        "POST",
-        "recover",
-        json={"email": data.email, "redirect_to": redirect_to},
+    "POST",
+    "recover",
+    params={"redirect_to": redirect_to},
+    json={"email": data.email},
+
     )
     if supa.status_code >= 400:
         try:

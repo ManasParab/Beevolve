@@ -90,21 +90,30 @@
   // MOBILE NORMALIZATION
   // ============================================================
 
- function normalizeMobile(value) {
-  let cleaned = value
+ 
+function normalizeMobile(value) {
+  let cleaned = String(value || "")
     .replace(/[^\d+]/g, "")
     .trim();
 
   if (cleaned.startsWith("+91")) {
     cleaned = cleaned.slice(3);
-  } else if (cleaned.startsWith("91") && cleaned.length > 10) {
+  } else if (cleaned.startsWith("0091")) {
+    cleaned = cleaned.slice(4);
+  } else if (cleaned.startsWith("91") && cleaned.length === 12) {
     cleaned = cleaned.slice(2);
   }
 
-  cleaned = cleaned.replace(/\D/g, "").slice(0, 10);
+  cleaned = cleaned.replace(/\D/g, "");
+
+  // Do not silently remove extra digits.
+  if (!/^[6-9]\d{9}$/.test(cleaned)) {
+    return "";
+  }
 
   return "+91" + cleaned;
-  }
+}
+
 
   // ============================================================
   // PASSWORD VALIDATION
@@ -1125,6 +1134,13 @@
           $("reg-mobile")
             ?.value || ""
         );
+
+      if (!mobile) {
+  return showMessage(
+    "Please enter a valid 10-digit Indian mobile number.",
+    "error"
+  );
+}  
 
 
       const password =
