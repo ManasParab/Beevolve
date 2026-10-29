@@ -10,6 +10,44 @@
     .checkout{min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0%,rgba(232,163,61,.13),transparent 38%),var(--bg)}
     .checkout-card{width:min(520px,100%);padding:clamp(24px,6vw,34px);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
     .checkout-card h1{font:600 clamp(36px,7vw,52px)/1.05 'Fraunces',serif;margin:18px 0 12px}.checkout-card p{color:var(--text-muted);line-height:1.65}.checkout-price{font:600 28px 'Fraunces',serif;color:var(--text);margin:24px 0}.checkout-card .btn-primary{margin-top:0}.back-link{display:inline-block;margin-top:20px;color:var(--text-muted);font-size:13px}.back-link:hover{color:var(--amber-light)}
+    
+    .autopay-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin: 20px 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
+      background: var(--bg);
+    }
+
+    .autopay-option input {
+      width: 17px;
+      height: 17px;
+      margin-top: 3px;
+      flex-shrink: 0;
+      accent-color: var(--amber-light);
+      cursor: pointer;
+    }
+
+    .autopay-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 5px; 
+    }
+
+    .autopay-copy strong {
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .autopay-copy small {
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
   </style>
 </head>
 <body>
@@ -17,8 +55,25 @@
     <div class="eyebrow">Secure test checkout</div>
     <h1 id="service-name">Career Toolkit</h1>
     <p>Complete your Beevolve purchase in the Razorpay test environment.</p>
-    <div id="service-price" class="checkout-price">Rs. 499</div>
-    <button id="pay-button" class="btn-primary" type="button">Continue to payment <span aria-hidden="true">-&gt;</span></button>
+    
+<div id="service-price" class="checkout-price">Rs. 499</div>
+
+<label class="autopay-option" for="enable-autopay">
+  <input type="checkbox" id="enable-autopay">
+  <span class="autopay-copy">
+    <strong>Enable Autopay</strong>
+    <small>
+      Automatically renew this service at the displayed billing interval.
+      You can manage your subscription later.
+    </small>
+  </span>
+</label>
+
+<button id="pay-button" class="btn-primary" type="button">
+  Continue to payment
+  <span aria-hidden="true">-&gt;</span>
+</button>
+
     <a class="back-link" href="subscriptions.html">&lt;- Back to services</a>
   </section></main>
   <script>
@@ -38,21 +93,91 @@
       document.getElementById("service-price").textContent = `Rs. ${amount}`;
     }
 
-    button.addEventListener("click", async () => {
-      button.disabled = true;
-      button.firstChild.textContent = "Opening checkout... ";
-      try {
-        const response = await fetch(`${API_BASE}/api/payments/create-order`, {method: "POST", credentials: "include", headers: {"Content-Type": "application/json"}, body: JSON.stringify({service})});
-        const order = await response.json();
-        if (!response.ok) throw new Error(order.detail || "Unable to create payment order.");
-        const razorpay = new Razorpay({key: order.key_id, amount: order.amount, currency: order.currency, name: "Beevolve", description: service, order_id: order.id, handler: verifyPayment});
-        razorpay.open();
-      } catch (error) {
-        alert(error.message || "Unable to start payment.");
-        button.disabled = false;
-        button.firstChild.textContent = "Continue to payment ";
+    
+  const autopayCheckbox = document.getElementById("enable-autopay");
+  const planId = params.get("plan_id");
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.firstChild.textContent = "Opening checkout... ";
+
+    try {
+      // Autopay selected: create a recurring Razorpay subscription
+      if (autopayCheckbox?.checked) {
+        if (!planId) {
+          throw new Error(
+            "Plan ID is missing. Please return to services and try again."
+          );
+        }
+
+        button.firstChild.textContent = "Preparing Autopay... ";
+
+        const response = await fetch(
+          `${API_BASE}/api/subscriptions/create`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ plan_id: planId })
+          }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+          throw new Error(result.detail || "Unable to start Autopay.");
+        }
+
+        if (!result.success || !result.short_url) {
+          throw new Error("Autopay checkout link was not returned.");
+        }
+
+        window.location.assign(result.short_url);
+        return;
       }
-    });
+
+      // Autopay unchecked: preserve your existing one-time payment flow
+      const response = await fetch(
+        `${API_BASE}/api/payments/create-order`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ service })
+        }
+      );
+
+      const order = await response.json();
+
+      if (!response.ok) {
+        throw new Error(order.detail || "Unable to create payment order.");
+      }
+
+      const razorpay = new Razorpay({
+        key: order.key_id,
+        amount: order.amount,
+        currency: order.currency,
+        name: "Beevolve",
+        description: service,
+        order_id: order.id,
+        handler: verifyPayment,
+        modal: {
+          ondismiss: function () {
+            button.disabled = false;
+            button.firstChild.textContent = "Continue to payment ";
+          }
+        }
+      });
+
+      razorpay.open();
+
+    } catch (error) {
+      alert(error.message || "Unable to start payment.");
+      button.disabled = false;
+      button.firstChild.textContent = "Continue to payment ";
+    }
+  });
+
 
     async function verifyPayment(payment) {
       const response = await fetch(`${API_BASE}/api/payments/verify`, {

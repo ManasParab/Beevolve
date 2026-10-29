@@ -289,9 +289,10 @@
         // Original one-time checkout flow
         if (PAYMENT_MODE === "one_time") {
           const params = new URLSearchParams({
-            service: button.dataset.service,
-            amount: button.dataset.amount
-          });
+          service: button.dataset.service,
+          amount: button.dataset.amount,
+          plan_id: button.dataset.planId
+        });
 
           window.location.href = `checkout.html?${params.toString()}`;
           return;
