@@ -1,152 +1,124 @@
-# This file needs two endpoints:
-# - POST /api/subscriptions/create — authenticate the user, load the selected plan from mst_plan, create the order records, and create a Razorpay subscription using the plan’s provider_plan_id.
-# - GET /api/subscriptions/me — return only the logged-in user’s subscriptions.
-# Before testing recurring payments, the required Razorpay plan IDs must be saved in mst_plan.provider_plan_id. Your database seed does not automatically create Razorpay plans.
+"""Recurring subscription creation, user subscription listing, and access check routes backed by PostgreSQL."""
 
-
-import logging
-import os
-import uuid
 from datetime import datetime, timezone
+import logging
+import uuid
 from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, status
+import psycopg
+from pydantic import BaseModel
 import razorpay
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
 
-from routes.auth import _user_id
-from supabase_client import supabase_rest_request
+from config import settings
+from database import get_db
+from routes.auth import get_current_user_id
 
-router = APIRouter(
-    prefix="/api/subscriptions",
-    tags=["Subscriptions"],
-)
-
+router = APIRouter(prefix="/api/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
-
-client = None
-
-if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
-    client = razorpay.Client(
-        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
-    )
+client = (
+    razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+    if settings.razorpay_key_id and settings.razorpay_key_secret
+    else None
+)
 
 
 class SubscriptionRequest(BaseModel):
-    plan_id: str = Field(min_length=1)
+    plan_id: str | None = None
+    service: str | None = None
 
 
-def check_response(response, message):
-    if response.status_code >= 400:
-        logger.error(
-            "%s: %s %s",
-            message,
-            response.status_code,
-            response.text,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=message,
-        )
-
+def _parse_optional_uuid(raw_value: str | None) -> str | None:
+    if not raw_value:
+        return None
     try:
-        return response.json()
+        return str(UUID(raw_value.strip()))
     except ValueError:
-        logger.exception("%s: Invalid JSON response", message)
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid response from the database service.",
-        )
-
-async def get_authenticated_user(request: Request) -> str:
-    token = request.cookies.get("beevolve_access")
-
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Please log in first.",
-        )
-
-    return await _user_id(token)
+        return None
 
 
 @router.post("/create")
-async def create_subscription(
+def create_subscription(
     data: SubscriptionRequest,
-    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
 ):
-    user_id = await get_authenticated_user(request)
-
+    """Create local order/order_items in PostgreSQL and start a Razorpay recurring subscription."""
     if client is None:
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Razorpay is not configured.",
         )
 
-    # Load an active plan configured for Razorpay subscriptions.
-    plan_response = await supabase_rest_request(
-        "GET",
-        "mst_plan",
-        params={
-            "select": "id,product_id,amount,currency,duration_days,provider_plan_id",
-            "id": f"eq.{data.plan_id}",
-            "status": "eq.active",
-            "provider_plan_id": "not.is.null",
-            "limit": "1",
-        },
-    )
-
-    plans = check_response(
-        plan_response,
-        "Unable to load the selected plan.",
-    )
-
-    if not plans:
+    plan_uuid = _parse_optional_uuid(data.plan_id)
+    service_name = (data.service or "").strip()
+    if not plan_uuid and not service_name:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A valid plan_id or service name is required.",
+        )
+
+    plan = None
+    with conn.cursor() as cur:
+        if plan_uuid:
+            cur.execute(
+                """
+                SELECT pl.id, pl.product_id, pl.amount, pl.currency,
+                       pl.duration_days, pl.provider_plan_id
+                  FROM public.mst_plan pl
+                 WHERE pl.id = %s
+                   AND pl.status = 'active'
+                   AND pl.provider_plan_id IS NOT NULL
+                 LIMIT 1
+                """,
+                (plan_uuid,),
+            )
+            plan = cur.fetchone()
+
+        if not plan and service_name:
+            cur.execute(
+                """
+                SELECT pl.id, pl.product_id, pl.amount, pl.currency,
+                       pl.duration_days, pl.provider_plan_id
+                  FROM public.mst_plan pl
+                  JOIN public.mst_product pr ON pr.id = pl.product_id
+                 WHERE LOWER(pr.name) = LOWER(%s)
+                   AND pl.status = 'active'
+                   AND pr.status = 'active'
+                   AND pl.provider_plan_id IS NOT NULL
+                 ORDER BY pl.created_date ASC
+                 LIMIT 1
+                """,
+                (service_name,),
+            )
+            plan = cur.fetchone()
+
+    if not plan:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Plan not found or not configured for autopay.",
         )
 
-    plan = plans[0]
     order_id = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.orders
+              (id, user_id, payment_mode, payment_provider, amount, currency)
+            VALUES (%s, %s, 'e-mandate', 'razorpay', %s, %s)
+            """,
+            (order_id, user_id, int(plan["amount"]), str(plan["currency"])),
+        )
+        cur.execute(
+            """
+            INSERT INTO public.order_items (order_id, plan_id, amount)
+            VALUES (%s, %s, %s)
+            """,
+            (order_id, plan["id"], int(plan["amount"])),
+        )
+    conn.commit()
 
-    # Create the local order before starting the Razorpay subscription.
-    order_response = await supabase_rest_request(
-        "POST",
-        "orders",
-        json={
-            "id": order_id,
-            "user_id": user_id,
-            "payment_mode": "e-mandate",
-            "payment_provider": "razorpay",
-            "amount": int(plan["amount"]),
-            "currency": plan["currency"],
-        },
-        extra_headers={"Prefer": "return=minimal"},
-    )
-
-    check_response(order_response, "Unable to create the order.")
-
-    item_response = await supabase_rest_request(
-        "POST",
-        "order_items",
-        json={
-            "order_id": order_id,
-            "plan_id": plan["id"],
-            "amount": int(plan["amount"]),
-        },
-        extra_headers={"Prefer": "return=minimal"},
-    )
-
-    check_response(
-        item_response,
-        "Unable to save the subscription order item.",
-    )
-
-    # Ask Razorpay to create the recurring subscription.
     try:
         subscription = client.subscription.create(
             {
@@ -158,19 +130,15 @@ async def create_subscription(
                 },
             }
         )
-    except Exception:
-        logger.exception(
-            "Razorpay subscription creation failed for order %s",
-            order_id,
-        )
+    except Exception as exc:
+        logger.exception("Razorpay subscription creation failed for order %s", order_id)
         raise HTTPException(
-            status_code=502,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
                 "Unable to start the subscription. "
-                "The local order may still exist; contact support "
-                "before retrying."
+                "The local order may still exist; contact support before retrying."
             ),
-        )
+        ) from exc
 
     return {
         "success": True,
@@ -182,77 +150,99 @@ async def create_subscription(
 
 
 @router.get("/me")
-async def get_my_subscriptions(request: Request):
-    user_id = await get_authenticated_user(request)
+def get_my_subscriptions(
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Return the logged-in user's subscriptions joined with plan and product metadata."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.id, s.product_id, s.plan_id, s.order_id,
+                   s.subscription_status, s.starts_at, s.expires_at,
+                   s.auto_renew, s.provider_subscription_id,
+                   s.auth_status, s.next_charge_at, s.created_date,
+                   pl.plan_interval, pl.duration_days, pl.amount, pl.currency,
+                   pr.slug AS product_slug, pr.name AS product_name,
+                   pr.category AS product_category
+              FROM public.subscriptions s
+              JOIN public.mst_plan pl ON pl.id = s.plan_id
+              JOIN public.mst_product pr ON pr.id = s.product_id
+             WHERE s.user_id = %s
+             ORDER BY s.created_date DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
 
-    response = await supabase_rest_request(
-        "GET",
-        "subscriptions",
-        params={
-            "select": (
-                "id,product_id,plan_id,order_id,"
-                "subscription_status,starts_at,expires_at,"
-                "auto_renew,provider_subscription_id,"
-                "auth_status,next_charge_at,"
-                "mst_plan(plan_interval,duration_days,amount,currency)"
-            ),
-            "user_id": f"eq.{user_id}",
-            "order": "created_date.desc",
-        },
-    )
-
-    subscriptions = check_response(
-        response,
-        "Unable to load your subscriptions.",
-    )
+    subscriptions = []
+    for row in rows:
+        subscriptions.append(
+            {
+                "id": str(row["id"]),
+                "product_id": str(row["product_id"]),
+                "product_name": row["product_name"],
+                "plan_id": str(row["plan_id"]),
+                "order_id": str(row["order_id"]),
+                "subscription_status": row["subscription_status"],
+                "starts_at": row["starts_at"].isoformat() if row["starts_at"] else None,
+                "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+                "auto_renew": bool(row["auto_renew"]),
+                "provider_subscription_id": row["provider_subscription_id"],
+                "auth_status": row["auth_status"],
+                "next_charge_at": (
+                    row["next_charge_at"].isoformat() if row["next_charge_at"] else None
+                ),
+                "created_date": (
+                    row["created_date"].isoformat() if row["created_date"] else None
+                ),
+                "mst_plan": {
+                    "plan_interval": row["plan_interval"],
+                    "duration_days": row["duration_days"],
+                    "amount": row["amount"],
+                    "currency": row["currency"],
+                    "mst_product": {
+                        "id": str(row["product_id"]),
+                        "slug": row["product_slug"],
+                        "name": row["product_name"],
+                        "category": row["product_category"],
+                    },
+                },
+            }
+        )
 
     return {"subscriptions": subscriptions}
 
-    
+
 @router.get("/access/{product_id}")
-async def check_product_access(
+def check_product_access(
     product_id: UUID,
-    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
 ):
-    user_id = await get_authenticated_user(request)
-
-    response = await supabase_rest_request(
-        "GET",
-        "subscriptions",
-        params={
-            "select": "id,subscription_status,starts_at,expires_at",
-            "user_id": f"eq.{user_id}",
-            "product_id": f"eq.{product_id}",
-            "subscription_status": "eq.active",
-            "status": "eq.active",
-        },
-    )
-
-    records = check_response(
-        response,
-        "Unable to verify product access.",
-    )
+    """Check whether the user currently holds an active non-expired subscription for product_id."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, subscription_status, starts_at, expires_at
+              FROM public.subscriptions
+             WHERE user_id = %s
+               AND product_id = %s
+               AND subscription_status = 'active'
+               AND status = 'active'
+            """,
+            (user_id, str(product_id)),
+        )
+        records = cur.fetchall()
 
     now = datetime.now(timezone.utc)
-
     for record in records:
         starts_at = record.get("starts_at")
         expires_at = record.get("expires_at")
-
-        if starts_at:
-            start = datetime.fromisoformat(
-                starts_at.replace("Z", "+00:00")
-            )
-            if start > now:
-                continue
-
-        if expires_at:
-            expiry = datetime.fromisoformat(
-                expires_at.replace("Z", "+00:00")
-            )
-            if expiry <= now:
-                continue
-
+        if starts_at and starts_at > now:
+            continue
+        if expires_at and expires_at <= now:
+            continue
         return {
             "has_access": True,
             "product_id": str(product_id),

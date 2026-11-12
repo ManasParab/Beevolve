@@ -1,206 +1,150 @@
-# This file will handle Razorpay events that arrive asynchronously, including:
-# - payment.captured
-# - payment.failed
-# - Subscription activation, cancellation and charge events
-# It must verify the Razorpay webhook signature using the configured webhook secret. It should call the database function register_webhook_event to prevent duplicate processing, then dispatch the event to the appropriate payment/subscription database function.
-# For example, successful one-time payments should use apply_payment_success; failed payments should use apply_payment_failure.
-# Important: Your latest ZIP doesn’t include the earlier RazorpaySandbox reference folder. We should not pretend we copied its webhook code. We’ll implement this file against your current SQL schema and verify it with test events before configuring the live webhook URL.
+"""Razorpay asynchronous webhook verification, deduplication, and PostgreSQL dispatch routes."""
 
-
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import logging
-import os
-from datetime import datetime, timezone
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
-from supabase_client import supabase_rest_request, supabase_rpc
+from fastapi import APIRouter, HTTPException, Request, status
+import psycopg
+from psycopg.errors import NoDataFound
+
+from config import settings
+from database import open_connection
 
 router = APIRouter(prefix="/api/webhooks", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
 
-RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 
-
-def epoch_to_iso(value):
-    """Convert Razorpay epoch seconds into a UTC timestamp."""
+def epoch_to_dt(value: int | str | None) -> datetime | None:
+    """Convert Razorpay epoch seconds into a UTC-aware datetime."""
     if value is None:
         return None
-
-    return datetime.fromtimestamp(
-        int(value), tz=timezone.utc
-    ).isoformat()
+    return datetime.fromtimestamp(int(value), tz=timezone.utc)
 
 
-def check_response(response, message):
-    if response.status_code >= 400:
-        logger.error(
-            "%s: %s %s",
-            message,
-            response.status_code,
-            response.text,
-        )
-        raise RuntimeError(message)
-
-    try:
-        return response.json()
-    except Exception:
-        return None
-
-
-async def mark_event_processed(event_id):
-    response = await supabase_rest_request(
-        "PATCH",
-        "webhook_events",
-        params={"event_id": f"eq.{event_id}"},
-        json={"processed_at": datetime.now(timezone.utc).isoformat()},
-        extra_headers={"Prefer": "return=minimal"},
-    )
-    check_response(response, "Could not mark webhook as processed")
-
-
-async def remove_event_for_retry(event_id):
-    response = await supabase_rest_request(
-        "DELETE",
-        "webhook_events",
-        params={"event_id": f"eq.{event_id}"},
-        extra_headers={"Prefer": "return=minimal"},
-    )
-    check_response(response, "Could not reset webhook event")
-
-
-async def dispatch_event(event_type, payload):
-    payment = (
-        payload.get("payload", {})
-        .get("payment", {})
-        .get("entity", {})
-    )
-
-    subscription = (
-        payload.get("payload", {})
-        .get("subscription", {})
-        .get("entity", {})
-    )
+def dispatch_event(conn: psycopg.Connection, event_type: str, payload: dict[str, Any]) -> None:
+    """Apply a verified Razorpay webhook event directly against PostgreSQL functions and tables."""
+    payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+    subscription = payload.get("payload", {}).get("subscription", {}).get("entity", {})
 
     if event_type == "payment.captured":
         provider_order_id = payment.get("order_id")
         payment_id = payment.get("id")
-
         if not provider_order_id or not payment_id:
             raise RuntimeError("Captured payment is missing its IDs")
 
-        response = await supabase_rpc(
-            "apply_payment_success",
-            {
-                "p_provider_order_id": provider_order_id,
-                "p_provider_payment_id": payment_id,
-                "p_payment_mode": payment.get("method"),
-                "p_amount": int(payment.get("amount", 0)),
-                "p_signature_verified": False,
-            },
-        )
-
-        # Autopay payments are handled by subscription.charged.
-        if (
-            response.status_code >= 400
-            and "ORDER_NOT_FOUND" in response.text
-        ):
-            logger.info(
-                "Captured payment belongs to an autopay flow: %s",
-                payment_id,
-            )
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT public.apply_payment_success(
+                          %s::text, %s::text, %s::text, %s::integer, %s::boolean
+                        )
+                        """,
+                        (
+                            provider_order_id,
+                            payment_id,
+                            payment.get("method"),
+                            int(payment.get("amount", 0)),
+                            False,
+                        ),
+                    )
+        except NoDataFound:
+            # Autopay payments arrive without a pre-existing checkout order row and are handled by subscription.charged.
+            logger.info("Captured payment belongs to an autopay flow: %s", payment_id)
             return
-
-        check_response(response, "Could not record captured payment")
 
     elif event_type == "payment.authorized":
         provider_order_id = payment.get("order_id")
-
         if not provider_order_id:
             raise RuntimeError("Authorized payment has no order ID")
 
-        response = await supabase_rest_request(
-            "PATCH",
-            "orders",
-            params={
-                "provider_order_id": f"eq.{provider_order_id}",
-                "order_status": "eq.pending",
-            },
-            json={"payment_status": "submitted"},
-            extra_headers={"Prefer": "return=minimal"},
-        )
-        check_response(response, "Could not update authorized payment")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.orders
+                   SET payment_status = 'submitted'
+                 WHERE provider_order_id = %s
+                   AND order_status = 'pending'
+                """,
+                (provider_order_id,),
+            )
 
     elif event_type == "payment.failed":
         provider_order_id = payment.get("order_id")
-
         if provider_order_id:
-            response = await supabase_rpc(
-                "apply_payment_failure",
-                {"p_provider_order_id": provider_order_id},
-            )
-            check_response(response, "Could not record failed payment")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT public.apply_payment_failure(%s::text)",
+                    (provider_order_id,),
+                )
 
     elif event_type == "subscription.charged":
         notes = subscription.get("notes") or {}
         order_id = notes.get("order_id")
         payment_id = payment.get("id")
-
         if not order_id or not payment_id or not subscription.get("id"):
-            raise RuntimeError(
-                "Subscription charge is missing required IDs or order notes"
+            raise RuntimeError("Subscription charge is missing required IDs or order notes")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT public.apply_subscription_charged(
+                  %s::uuid, %s::text, %s::text, %s::text, %s::integer,
+                  %s::timestamptz, %s::timestamptz, %s::timestamptz, %s::text
+                )
+                """,
+                (
+                    order_id,
+                    subscription["id"],
+                    payment_id,
+                    payment.get("order_id"),
+                    int(payment.get("amount", 0)),
+                    epoch_to_dt(payment.get("created_at")),
+                    epoch_to_dt(subscription.get("current_end")),
+                    epoch_to_dt(subscription.get("charge_at")),
+                    payment.get("method"),
+                ),
             )
 
-        response = await supabase_rpc(
-            "apply_subscription_charged",
-            {
-                "p_order_id": order_id,
-                "p_provider_subscription_id": subscription["id"],
-                "p_provider_payment_id": payment_id,
-                "p_provider_order_id": payment.get("order_id"),
-                "p_amount": int(payment.get("amount", 0)),
-                "p_paid_at": epoch_to_iso(payment.get("created_at")),
-                "p_current_end": epoch_to_iso(subscription.get("current_end")),
-                "p_charge_at": epoch_to_iso(subscription.get("charge_at")),
-                "p_payment_method": payment.get("method"),
-            },
-        )
-        check_response(response, "Could not record subscription charge")
-
-    elif event_type.startswith("subscription."):
+    elif event_type in {
+        "subscription.authenticated",
+        "subscription.activated",
+        "subscription.pending",
+        "subscription.halted",
+        "subscription.cancelled",
+        "subscription.completed",
+    }:
         subscription_id = subscription.get("id")
-
         if not subscription_id:
             raise RuntimeError("Subscription event is missing its ID")
 
-        if event_type in {
-            "subscription.authenticated",
-            "subscription.activated",
-            "subscription.pending",
-            "subscription.halted",
-            "subscription.cancelled",
-            "subscription.completed",
-        }:
-            response = await supabase_rpc(
-                "apply_subscription_status",
-                {
-                    "p_provider_subscription_id": subscription_id,
-                    "p_provider_status": subscription.get("status"),
-                    "p_charge_at": epoch_to_iso(
-                        subscription.get("charge_at")
-                    ),
-                },
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT public.apply_subscription_status(
+                  %s::text, %s::text, %s::timestamptz
+                )
+                """,
+                (
+                    subscription_id,
+                    subscription.get("status"),
+                    epoch_to_dt(subscription.get("charge_at")),
+                ),
             )
-            check_response(response, "Could not update subscription status")
 
 
 @router.post("/razorpay")
 async def razorpay_webhook(request: Request):
-    if not RAZORPAY_WEBHOOK_SECRET:
+    """Verify Razorpay webhook signature, deduplicate in PostgreSQL, and process event."""
+    if not settings.razorpay_webhook_secret:
         logger.error("RAZORPAY_WEBHOOK_SECRET is not configured")
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Webhook configuration is missing",
         )
 
@@ -210,72 +154,82 @@ async def razorpay_webhook(request: Request):
 
     if not signature or not event_id:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing Razorpay webhook headers",
         )
 
     expected_signature = hmac.new(
-        RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
+        settings.razorpay_webhook_secret.encode("utf-8"),
         raw_body,
         hashlib.sha256,
     ).hexdigest()
 
     if not hmac.compare_digest(expected_signature, signature):
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid webhook signature",
+        )
 
     try:
         payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON payload",
+        ) from exc
 
     event_type = payload.get("event")
-
     if not event_type:
-        raise HTTPException(status_code=400, detail="Missing event type")
-
-    registration = await supabase_rpc(
-        "register_webhook_event",
-        {
-            "p_event_id": event_id,
-            "p_event_type": event_type,
-            "p_payload": payload,
-        },
-    )
-    registered = check_response(
-        registration, "Could not register webhook event"
-    )
-
-    # Supabase may return the boolean directly or inside a one-row result.
-    if isinstance(registered, list) and registered:
-        registered = next(iter(registered[0].values()))
-
-    if registered is not True:
-        return {"status": "duplicate"}
-
-    try:
-        await dispatch_event(event_type, payload)
-        await mark_event_processed(event_id)
-    except Exception:
-        logger.exception(
-            "Webhook processing failed for event %s (%s)",
-            event_id,
-            event_type,
-        )
-
-        # Remove the deduplication entry so Razorpay can retry the event.
-        try:
-            await remove_event_for_retry(event_id)
-        except Exception:
-            logger.exception("Could not reset failed webhook event %s", event_id)
-
         raise HTTPException(
-            status_code=500,
-            detail="Webhook processing failed",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing event type",
         )
+
+    conn = open_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.register_webhook_event(%s::text, %s::text, %s::jsonb) AS registered",
+                (event_id, event_type, json.dumps(payload)),
+            )
+            reg_row = cur.fetchone()
+        conn.commit()
+
+        if not reg_row or reg_row["registered"] is not True:
+            return {"status": "duplicate"}
+
+        try:
+            dispatch_event(conn, event_type, payload)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE public.webhook_events
+                       SET processed_at = %s
+                     WHERE event_id = %s
+                    """,
+                    (datetime.now(timezone.utc), event_id),
+                )
+            conn.commit()
+        except Exception as exc:
+            logger.exception("Webhook processing failed for event %s (%s)", event_id, event_type)
+            if not conn.closed:
+                conn.rollback()
+            # Remove deduplication entry so Razorpay can retry the event.
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM public.webhook_events WHERE event_id = %s",
+                        (event_id,),
+                    )
+                conn.commit()
+            except Exception:
+                logger.exception("Could not reset failed webhook event %s", event_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Webhook processing failed",
+            ) from exc
+    finally:
+        if not conn.closed:
+            conn.close()
 
     return {"status": "processed"}
-
-# Before we test it
-# Two important checks remain:
-#- Your .env must contain RAZORPAY_WEBHOOK_SECRET with the webhook secret configured in Razorpay. It is different from RAZORPAY_KEY_SECRET.
-# - The code expects webhook_events.processed_at to exist. We need to verify that column before testing, and then register this router in main.py.

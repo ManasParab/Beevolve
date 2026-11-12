@@ -1,0 +1,10 @@
+name: BeEvolve Auth POC - Local
+values:
+  - key: base_url
+    value: 'http://127.0.0.1:8000'
+  - key: access_token
+    value: ''
+  - key: refresh_token
+    value: ''
+  - key: google_id_token
+    value: PASTE_GOOGLE_ID_TOKEN_HERE

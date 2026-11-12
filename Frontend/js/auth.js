@@ -1,8 +1,7 @@
 (() => {
   "use strict";
 
-  // Supabase is intentionally NOT initialized in the browser.
-  // All Supabase credentials live in Backend/.env.
+  // All authentication, OTP, and PostgreSQL sessions use HttpOnly cookies via FastAPI.
   const API_BASE = "http://127.0.0.1:8000";
 
   const $ = (id) => document.getElementById(id);
@@ -1257,6 +1256,7 @@ function normalizeMobile(value) {
                 email,
                 mobile,
                 password,
+                confirm_password: confirm,
                 terms_accepted: true,
               })
 
@@ -1626,6 +1626,12 @@ function normalizeMobile(value) {
   // verification is now done using our custom OTP.
 
   (async () => {
+
+    const queryParams = new URLSearchParams(window.location.search);
+    if (queryParams.get("oauth_error")) {
+      showMessage("Google sign-in failed or was cancelled. Please try again.", "error");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
 
     try {
 

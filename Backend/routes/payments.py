@@ -1,27 +1,25 @@
+"""Razorpay one-time checkout order creation and payment verification routes backed by PostgreSQL."""
 
-import os
-import uuid
 from datetime import date
+import logging
+import uuid
 
-import razorpay
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, status
+import psycopg
 from pydantic import BaseModel, Field
+import razorpay
 
-from routes.auth import _user_id
-from supabase_client import supabase_rest_request, supabase_rpc
+from config import settings
+from database import get_db
+from routes.auth import get_current_user_id
 
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
+logger = logging.getLogger(__name__)
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
-
-if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-    raise RuntimeError(
-        "RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET are missing from .env"
-    )
-
-client = razorpay.Client(
-    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+client = (
+    razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+    if settings.razorpay_key_id and settings.razorpay_key_secret
+    else None
 )
 
 
@@ -36,101 +34,95 @@ class OrderRequest(BaseModel):
     coupon_code: str | None = None
 
 
-def require_success(response, message: str):
-    if response.status_code >= 400:
-        print("DATABASE ERROR:", response.status_code, response.text)
-        raise HTTPException(status_code=500, detail=message)
-
-    try:
-        return response.json()
-    except Exception:
-        return []
-
-
-async def get_authenticated_user(request: Request) -> tuple[str, str]:
-    token = request.cookies.get("beevolve_access")
-
-    if not token:
-        raise HTTPException(status_code=401, detail="Please log in first.")
-
-    user_id = await _user_id(token)
-    return token, user_id
+def _as_date(value: date | str | None) -> date | None:
+    if value is None:
+        return None
+    return value if isinstance(value, date) else date.fromisoformat(value)
 
 
 @router.post("/create-order")
-async def create_order(data: OrderRequest, request: Request):
-    _, user_id = await get_authenticated_user(request)
-
-    # Find the active plan for this service.
-    plan_response = await supabase_rest_request(
-        "GET",
-        "mst_plan",
-        params={
-            "select": "id,product_id,amount,currency,duration_days,mst_product!inner(name,is_active,status)",
-            "status": "eq.active",
-            "mst_product.name": f"eq.{data.service}",
-            "mst_product.is_active": "eq.true",
-            "mst_product.status": "eq.active",
-            "limit": "1",
-        },
-    )
-    plans = require_success(plan_response, "Unable to load the selected plan.")
-
-    if not plans:
-        raise HTTPException(status_code=400, detail="Unknown or inactive service.")
-
-    plan = plans[0]
-    final_amount = int(plan["amount"])
-    currency = plan["currency"]
-    coupon_id = None
-
-    # Validate a coupon if one was supplied.
-    if data.coupon_code:
-        coupon_response = await supabase_rest_request(
-            "GET",
-            "mst_coupon",
-            params={
-                "select": "id,code,discount_type,discount_value,max_redemptions,times_redeemed,start_date,expiry_date",
-                "code": f"eq.{data.coupon_code.strip()}",
-                "status": "eq.active",
-                "limit": "1",
-            },
-        )
-        coupons = require_success(
-            coupon_response, "Unable to validate the coupon."
+def create_order(
+    data: OrderRequest,
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Create a Razorpay one-time order from PostgreSQL plan/coupon pricing and record it."""
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay is not configured in Backend/.env.",
         )
 
-        if not coupons:
-            raise HTTPException(status_code=400, detail="Invalid coupon code.")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT pl.id, pl.amount, pl.currency
+              FROM public.mst_plan pl
+              JOIN public.mst_product pr ON pr.id = pl.product_id
+             WHERE pl.status = 'active'
+               AND pr.status = 'active'
+               AND pr.is_active = TRUE
+               AND LOWER(pr.name) = LOWER(%s)
+             ORDER BY pl.created_date ASC
+             LIMIT 1
+            """,
+            (data.service.strip(),),
+        )
+        plan = cur.fetchone()
 
-        coupon = coupons[0]
-        today = date.today()
+        if not plan:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unknown or inactive service.",
+            )
 
-        if coupon["start_date"] and today < date.fromisoformat(coupon["start_date"]):
-            raise HTTPException(status_code=400, detail="Coupon is not active yet.")
+        final_amount = int(plan["amount"])
+        currency = str(plan["currency"])
+        coupon_id = None
 
-        if coupon["expiry_date"] and today > date.fromisoformat(coupon["expiry_date"]):
-            raise HTTPException(status_code=400, detail="Coupon has expired.")
+        if data.coupon_code:
+            cur.execute(
+                """
+                SELECT id, code, discount_type, discount_value,
+                       max_redemptions, times_redeemed, start_date, expiry_date
+                  FROM public.mst_coupon
+                 WHERE LOWER(code) = LOWER(%s)
+                   AND status = 'active'
+                 LIMIT 1
+                """,
+                (data.coupon_code.strip(),),
+            )
+            coupon = cur.fetchone()
 
-        max_redemptions = coupon["max_redemptions"]
-        if (
-            max_redemptions is not None
-            and coupon["times_redeemed"] >= max_redemptions
-        ):
-            raise HTTPException(status_code=400, detail="Coupon redemption limit reached.")
+            if not coupon:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid coupon code.")
 
-        value = int(coupon["discount_value"])
+            today = date.today()
+            start_date = _as_date(coupon["start_date"])
+            expiry_date = _as_date(coupon["expiry_date"])
 
-        if coupon["discount_type"] == "percent":
-            final_amount = final_amount - (final_amount * value // 100)
-        else:
-            final_amount = max(final_amount - value, 0)
+            if start_date and today < start_date:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Coupon is not active yet.")
+            if expiry_date and today > expiry_date:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Coupon has expired.")
 
-        coupon_id = coupon["id"]
+            max_redemptions = coupon["max_redemptions"]
+            if max_redemptions is not None and coupon["times_redeemed"] >= max_redemptions:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Coupon redemption limit reached.",
+                )
+
+            value = int(coupon["discount_value"])
+            if coupon["discount_type"] == "percent":
+                final_amount = final_amount - (final_amount * value // 100)
+            else:
+                final_amount = max(final_amount - value, 0)
+
+            coupon_id = str(coupon["id"])
 
     order_id = str(uuid.uuid4())
 
-    # Create the Razorpay order using the server-calculated amount.
     try:
         razorpay_order = client.order.create(
             {
@@ -143,81 +135,71 @@ async def create_order(data: OrderRequest, request: Request):
                 },
             }
         )
-    except Exception:
+    except Exception as exc:
+        logger.exception("Razorpay order.create failed for order %s", order_id)
         raise HTTPException(
-            status_code=502,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to create the payment order. Please try again.",
+        ) from exc
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.orders
+              (id, user_id, coupon_id, provider_order_id, payment_provider, amount, currency)
+            VALUES (%s, %s, %s, %s, 'razorpay', %s, %s)
+            """,
+            (
+                order_id,
+                user_id,
+                coupon_id,
+                razorpay_order["id"],
+                final_amount,
+                currency,
+            ),
         )
-
-    # Save the order in the database.
-    order_response = await supabase_rest_request(
-        "POST",
-        "orders",
-        json={
-            "id": order_id,
-            "user_id": user_id,
-            "coupon_id": coupon_id,
-            "provider_order_id": razorpay_order["id"],
-            "payment_provider": "razorpay",
-            "amount": final_amount,
-            "currency": currency,
-        },
-        extra_headers={"Prefer": "return=minimal"},
-    )
-
-    if order_response.status_code >= 400:
-        print("ORDER SAVE ERROR:", order_response.status_code, order_response.text)
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to save the order. Please contact support before retrying.",
+        cur.execute(
+            """
+            INSERT INTO public.order_items (order_id, plan_id, amount)
+            VALUES (%s, %s, %s)
+            """,
+            (order_id, plan["id"], final_amount),
         )
+    conn.commit()
 
-    # Save the selected plan against the order.
-    item_response = await supabase_rest_request(
-        "POST",
-        "order_items",
-        json={
-            "order_id": order_id,
-            "plan_id": plan["id"],
-            "amount": final_amount,
-        },
-        extra_headers={"Prefer": "return=minimal"},
-    )
-
-    if item_response.status_code >= 400:
-        print("ORDER ITEM SAVE ERROR:", item_response.status_code, item_response.text)
-        raise HTTPException(
-            status_code=500,
-            detail="The order was created but its item could not be saved. Please contact support.",
-        )
-
-    razorpay_order["key_id"] = RAZORPAY_KEY_ID
+    razorpay_order["key_id"] = settings.razorpay_key_id
     return razorpay_order
 
 
 @router.post("/verify")
-async def verify_payment(data: PaymentVerification, request: Request):
-    _, user_id = await get_authenticated_user(request)
+def verify_payment(
+    data: PaymentVerification,
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Verify Razorpay signature and capture status, then activate access via PostgreSQL."""
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay is not configured in Backend/.env.",
+        )
 
-    # Make sure this order belongs to the logged-in user.
-    order_response = await supabase_rest_request(
-        "GET",
-        "orders",
-        params={
-            "select": "id,provider_order_id,amount,payment_status",
-            "provider_order_id": f"eq.{data.razorpay_order_id}",
-            "user_id": f"eq.{user_id}",
-            "limit": "1",
-        },
-    )
-    orders = require_success(order_response, "Unable to check this order.")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, provider_order_id, amount, payment_status
+              FROM public.orders
+             WHERE provider_order_id = %s
+               AND user_id = %s
+             LIMIT 1
+            """,
+            (data.razorpay_order_id, user_id),
+        )
+        order = cur.fetchone()
 
-    if not orders:
-        raise HTTPException(status_code=404, detail="Order not found.")
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
-    order = orders[0]
-
-    # Reject an invalid signature without changing the database.
     try:
         client.utility.verify_payment_signature(data.model_dump())
     except Exception:
@@ -228,61 +210,53 @@ async def verify_payment(data: PaymentVerification, request: Request):
 
     try:
         payment = client.payment.fetch(data.razorpay_payment_id)
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
-            status_code=502,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to check the payment status. Please try again.",
-        )
+        ) from exc
 
     if payment.get("order_id") != data.razorpay_order_id:
-        raise HTTPException(status_code=400, detail="Payment order mismatch.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payment order mismatch.")
 
     if int(payment.get("amount", -1)) != int(order["amount"]):
-        raise HTTPException(status_code=400, detail="Payment amount mismatch.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payment amount mismatch.")
 
-    if payment.get("status") == "captured":
-        rpc_response = await supabase_rpc(
-            "apply_payment_success",
-            {
-                "p_provider_order_id": data.razorpay_order_id,
-                "p_provider_payment_id": data.razorpay_payment_id,
-                "p_payment_mode": payment.get("method"),
-                "p_amount": int(payment["amount"]),
-                "p_signature_verified": True,
-            },
-        )
-
-        if rpc_response.status_code >= 400:
-            print("PAYMENT RPC ERROR:", rpc_response.status_code, rpc_response.text)
-            raise HTTPException(
-                status_code=500,
-                detail="Payment was received but could not be recorded. Please contact support.",
+    payment_status = payment.get("status")
+    if payment_status == "captured":
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT public.apply_payment_success(
+                  %s::text, %s::text, %s::text, %s::integer, %s::boolean
+                )
+                """,
+                (
+                    data.razorpay_order_id,
+                    data.razorpay_payment_id,
+                    payment.get("method"),
+                    int(payment["amount"]),
+                    True,
+                ),
             )
-
+        conn.commit()
         return {
             "success": True,
             "message": "Payment verified successfully!",
         }
 
-    if payment.get("status") == "authorized":
-        pending_response = await supabase_rest_request(
-            "PATCH",
-            "orders",
-            params={
-                "provider_order_id": f"eq.{data.razorpay_order_id}",
-                "user_id": f"eq.{user_id}",
-            },
-            json={"payment_status": "submitted"},
-            extra_headers={"Prefer": "return=minimal"},
-        )
-
-        if pending_response.status_code >= 400:
-            print("PAYMENT STATUS ERROR:", pending_response.status_code, pending_response.text)
-            raise HTTPException(
-                status_code=500,
-                detail="Unable to update payment status.",
+    if payment_status == "authorized":
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.orders
+                   SET payment_status = 'submitted'
+                 WHERE provider_order_id = %s
+                   AND user_id = %s
+                """,
+                (data.razorpay_order_id, user_id),
             )
-
+        conn.commit()
         return {
             "success": False,
             "pending": True,

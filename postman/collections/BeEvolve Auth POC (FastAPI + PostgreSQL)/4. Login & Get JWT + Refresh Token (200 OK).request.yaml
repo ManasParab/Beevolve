@@ -1,0 +1,23 @@
+$kind: http-request
+url: "{{base_url}}/auth/login"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "email": "tanay@example.com",
+      "password": "StrongPass@123"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      if (pm.response.code === 200) {
+          const data = pm.response.json();
+          pm.environment.set('access_token', data.access_token);
+          pm.environment.set('refresh_token', data.refresh_token);
+          console.log('Saved access_token and refresh_token to environment.');
+      }
+    language: text/javascript
+order: 6000

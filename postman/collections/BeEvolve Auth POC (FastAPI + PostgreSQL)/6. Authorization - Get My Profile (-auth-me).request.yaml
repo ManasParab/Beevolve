@@ -1,0 +1,9 @@
+$kind: http-request
+name: 6. Authorization - Get My Profile (/auth/me)
+url: "{{base_url}}/auth/me"
+method: GET
+auth:
+  type: bearer
+  credentials:
+    token: "{{access_token}}"
+order: 8000

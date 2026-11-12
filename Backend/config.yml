@@ -1,0 +1,28 @@
+app:
+  name: "BeEvolve API"
+  version: "2.0.0"
+
+auth:
+  jwt_algorithm: "HS256"
+  access_token_expire_minutes: 15
+  refresh_token_expire_days: 7
+  password_reset_expire_minutes: 30
+  oauth_state_expire_minutes: 10
+  bcrypt_rounds: 12
+  require_email_verification: false
+  login_max_attempts: 5
+  login_lockout_seconds: 600
+  access_cookie_name: "beevolve_access"
+  refresh_cookie_name: "beevolve_refresh"
+  cookie_samesite: "lax"
+
+otp:
+  expiry_minutes: 10
+  max_attempts: 5
+  resend_seconds: 60
+
+google_oauth:
+  token_url: "https://oauth2.googleapis.com/token"
+  auth_url: "https://accounts.google.com/o/oauth2/v2/auth"
+  userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo"
+  scopes: "openid email profile"

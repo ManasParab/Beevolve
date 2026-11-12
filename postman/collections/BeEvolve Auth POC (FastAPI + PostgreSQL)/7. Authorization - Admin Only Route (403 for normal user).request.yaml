@@ -1,0 +1,8 @@
+$kind: http-request
+url: "{{base_url}}/auth/admin-only"
+method: GET
+auth:
+  type: bearer
+  credentials:
+    token: "{{access_token}}"
+order: 9000

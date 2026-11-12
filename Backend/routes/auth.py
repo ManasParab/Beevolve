@@ -1,634 +1,588 @@
-import os
-import re
-import secrets
-import hashlib
+"""Authentication, OTP verification, session cookie, profile, and Google OAuth routes."""
+
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 import hmac
+import logging
 import smtplib
 import time
-from email.message import EmailMessage
-from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import urlencode
+from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
+import httpx
+import psycopg
+from psycopg.errors import UniqueViolation
+from pydantic import BaseModel, EmailStr, Field
 
-from supabase_client import (
-    SUPABASE_URL,
-    SUPABASE_PUBLISHABLE_KEY,
-    SUPABASE_SECRET_KEY,
-    supabase_request,
-    supabase_rest_request,
+from config import settings
+from database import get_db
+from security import (
+    TokenError,
+    create_access_token,
+    create_oauth_state,
+    create_reset_token,
+    decode_access_token,
+    decode_reset_token,
+    generate_email_otp,
+    generate_refresh_token,
+    hash_email_otp,
+    hash_password,
+    hash_refresh_token,
+    normalize_indian_mobile,
+    validate_password_strength,
+    verify_oauth_state,
+    verify_password,
 )
 
-# Login attempt protection
-LOGIN_MAX_ATTEMPTS = 5
-LOGIN_LOCKOUT_SECONDS = 10 * 60
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+logger = logging.getLogger(__name__)
 
-_login_attempts = {}
+# In-memory brute-force lockout protection keyed by client IP + lowercase email.
+_login_attempts: dict[str, dict[str, float | int]] = {}
 
-def get_login_key(request: Request, email: str) -> str:
+
+def _cookie_kwargs() -> dict[str, Any]:
+    return {
+        "httponly": True,
+        "secure": settings.cookie_secure,
+        "samesite": settings.cookie_samesite,
+        "path": "/",
+    }
+
+
+def set_session_cookies(
+    response: Response,
+    access_token: str,
+    refresh_token: str | None,
+) -> None:
+    """Attach HttpOnly access and refresh session cookies to a response."""
+    kwargs = _cookie_kwargs()
+    response.set_cookie(
+        settings.access_cookie_name,
+        access_token,
+        max_age=settings.access_token_expire_minutes * 60,
+        **kwargs,
+    )
+    if refresh_token:
+        response.set_cookie(
+            settings.refresh_cookie_name,
+            refresh_token,
+            max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
+            **kwargs,
+        )
+
+
+def clear_session_cookies(response: Response) -> None:
+    """Expire authentication cookies cleanly."""
+    for name in (
+        settings.access_cookie_name,
+        settings.refresh_cookie_name,
+        settings.reset_cookie_name,
+    ):
+        response.delete_cookie(name, path="/")
+
+
+def extract_access_token(request: Request) -> str | None:
+    """Read JWT access token from HttpOnly cookie first, then Authorization header."""
+    cookie_token = request.cookies.get(settings.access_cookie_name)
+    if cookie_token:
+        return cookie_token
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip() or None
+    return None
+
+
+def _get_login_key(request: Request, email: str) -> str:
     client_ip = request.client.host if request.client else "unknown"
     return f"{client_ip}:{email.strip().lower()}"
 
-router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://127.0.0.1:5500/Frontend").rstrip("/")
+def _serialize_user(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "email": row["email"],
+        "full_name": row.get("full_name") or "",
+        "mobile": row.get("mobile"),
+        "role": row.get("role", "user"),
+        "email_verified": bool(row.get("email_verified")),
+        "account_status": row.get("account_status", "active"),
+    }
 
-# ============================================================
-# EMAIL OTP SETTINGS
-# ============================================================
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME or "")
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Beevolve")
+def _fetch_active_user_by_id(conn: psycopg.Connection, user_id: str) -> dict[str, Any] | None:
+    try:
+        parsed_id = str(UUID(str(user_id)))
+    except ValueError:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, email, full_name, mobile, role, account_status,
+                   email_verified, mfa_enabled, status, created_date, updated_date
+              FROM public.users
+             WHERE id = %s
+               AND deleted_at IS NULL
+               AND account_status = 'active'
+               AND status = 'active'
+             LIMIT 1
+            """,
+            (parsed_id,),
+        )
+        return cur.fetchone()
 
-EMAIL_OTP_EXPIRY_MINUTES = int(
-    os.getenv("EMAIL_OTP_EXPIRY_MINUTES", "5")
-)
 
-EMAIL_OTP_MAX_ATTEMPTS = int(
-    os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5")
-)
+def get_current_user(
+    request: Request,
+    conn: psycopg.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """Authenticate request via HttpOnly cookie or Bearer JWT against PostgreSQL."""
+    token = extract_access_token(request)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated. Please log in first.",
+        )
 
-EMAIL_OTP_RESEND_SECONDS = int(
-    os.getenv("EMAIL_OTP_RESEND_SECONDS", "60")
-)
+    try:
+        payload = decode_access_token(token)
+    except TokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
 
-EMAIL_OTP_PEPPER = os.getenv("EMAIL_OTP_PEPPER")
+    user = _fetch_active_user_by_id(conn, str(payload["sub"]))
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is unavailable or inactive.",
+        )
+    return user
 
-if not SMTP_USERNAME:
-    print("WARNING: SMTP_USERNAME is missing from .env")
 
-if not SMTP_PASSWORD:
-    print("WARNING: SMTP_PASSWORD is missing from .env")
+def get_current_user_id(user: dict[str, Any] = Depends(get_current_user)) -> str:
+    """FastAPI dependency returning the authenticated PostgreSQL user UUID string."""
+    return str(user["id"])
 
-if not EMAIL_OTP_PEPPER:
-    print("WARNING: EMAIL_OTP_PEPPER is missing from .env")
 
-COOKIE_KWARGS = {
-    "httponly": True,
-    "secure": COOKIE_SECURE,
-    "samesite": "lax",
-    "path": "/",
-}
+def _log_activity(
+    conn: psycopg.Connection,
+    actor_user_id: str | None,
+    action: str,
+    entity_type: str = "users",
+    entity_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    import json
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.user_activity_log
+              (actor_user_id, action, entity_type, entity_id, metadata)
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                actor_user_id,
+                action,
+                entity_type,
+                entity_id,
+                json.dumps(metadata or {}),
+            ),
+        )
+
+
+def _issue_session_tokens(
+    conn: psycopg.Connection,
+    user: dict[str, Any],
+) -> tuple[str, str, int]:
+    """Create JWT access token and persist a hashed refresh token in PostgreSQL."""
+    user_id = str(user["id"])
+    access_token, expires_in = create_access_token(
+        user_id=user_id,
+        email=str(user["email"]),
+        role=str(user.get("role", "user")),
+    )
+    raw_refresh = generate_refresh_token()
+    refresh_hash = hash_refresh_token(raw_refresh)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.refresh_tokens (user_id, token_hash, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (user_id, refresh_hash, expires_at),
+        )
+
+    return access_token, raw_refresh, expires_in
+
+
+def _send_smtp_email(to_email: str, subject: str, body_text: str) -> None:
+    if not settings.smtp_username or not settings.smtp_password:
+        raise RuntimeError("Gmail SMTP credentials are missing.")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = (
+        f"{settings.smtp_from_name} <{settings.smtp_from_email}>"
+        if settings.smtp_from_email
+        else settings.smtp_username
+    )
+    message["To"] = to_email
+    message.set_content(body_text)
+
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(settings.smtp_username, settings.smtp_password)
+        server.send_message(message)
+
 
 class RegisterRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=2, max_length=120)
     email: EmailStr
     mobile: str
     password: str
-    terms_accepted: bool
+    confirm_password: str | None = None
+    terms_accepted: bool = True
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str | None = None
+
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+
 
 class OAuthExchangeRequest(BaseModel):
     access_token: str
     refresh_token: str | None = None
 
+
 class UpdatePasswordRequest(BaseModel):
     password: str
+    token: str | None = None
+
 
 class UpdateProfileRequest(BaseModel):
-    full_name: str
+    full_name: str = Field(min_length=2, max_length=120)
     mobile: str = ""
     email: EmailStr
+
 
 class SendEmailOtpRequest(BaseModel):
     email: EmailStr
     user_id: str
+
 
 class VerifyEmailOtpRequest(BaseModel):
     email: EmailStr
     user_id: str
     code: str
 
-def set_session_cookies(response: Response, access_token: str, refresh_token: str | None):
-    response.set_cookie("beevolve_access", access_token, max_age=3600, **COOKIE_KWARGS)
-    if refresh_token:
-        response.set_cookie("beevolve_refresh", refresh_token, max_age=60 * 60 * 24 * 30, **COOKIE_KWARGS)
 
-def clear_session_cookies(response: Response):
-    response.delete_cookie("beevolve_access", path="/")
-    response.delete_cookie("beevolve_refresh", path="/")
-
-def friendly_supabase_error(payload: dict, fallback: str):
-    message = payload.get("msg") or payload.get("message") or payload.get("error_description") or payload.get("error")
-    return message or fallback
-
-# ============================================================
-# EMAIL OTP HELPERS
-# ============================================================
-
-def generate_email_otp() -> str:
-    letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
-    numbers = "23456789"
-
-    # Guarantee at least 1 letter and 1 number
-    otp = [
-        secrets.choice(letters),
-        secrets.choice(numbers)
-    ]
-
-    # Fill remaining 4 characters
-    alphabet = letters + numbers
-    otp.extend(secrets.choice(alphabet) for _ in range(4))
-
-    # Shuffle so the number isn't always in position 2
-    secrets.SystemRandom().shuffle(otp)
-
-    return "".join(otp)
+class GoogleIdTokenRequest(BaseModel):
+    id_token: str = Field(min_length=10)
 
 
-def hash_email_otp(otp: str) -> str:
-    """
-    Hash the OTP before storing it in the database.
-    """
-    if not EMAIL_OTP_PEPPER:
-        raise RuntimeError("EMAIL_OTP_PEPPER is missing from .env")
-
-    normalized = otp.strip().upper()
-
-    return hashlib.sha256(
-        f"{EMAIL_OTP_PEPPER}:{normalized}".encode("utf-8")
-    ).hexdigest()
-
-
-def send_email_otp_message(to_email: str, otp: str):
-    """
-    Sends the OTP through Gmail SMTP.
-    """
-
-    if not SMTP_USERNAME or not SMTP_PASSWORD:
-        raise RuntimeError("Gmail SMTP credentials are missing.")
-
-    message = EmailMessage()
-
-    message["Subject"] = "Beevolve email verification code"
-    message["From"] = (
-        f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-        if SMTP_FROM_EMAIL
-        else SMTP_USERNAME
-    )
-    message["To"] = to_email
-
-    message.set_content(
-        f"""Hi,
-
-Your Beevolve email verification code is:
-
-{otp}
-
-This code will expire in {EMAIL_OTP_EXPIRY_MINUTES} minutes.
-
-If you did not create a Beevolve account, you can safely ignore this email.
-
-Regards,
-Beevolve Team
-"""
-    )
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(message)
-
-@router.post("/register")
-async def register_user(data: RegisterRequest, response: Response):
-
-    # Check Terms & Conditions acceptance
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+def register_user(
+    data: RegisterRequest,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Validate inputs, check uniqueness in PostgreSQL, bcrypt-hash password, and save user."""
     if not data.terms_accepted:
         raise HTTPException(
-            status_code=400,
-            detail="Please accept the Terms & Conditions and Privacy Policy."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please accept the Terms & Conditions and Privacy Policy.",
         )
 
-    # Validate Indian mobile number
-    mobile = re.sub(r"\D", "", data.mobile or "")
+    if data.confirm_password is not None and data.password != data.confirm_password:
+        raise HTTPException(
+            status_code=422,
+            detail="Password and confirm_password do not match.",
+        )
 
-    if mobile.startswith("0091") and len(mobile) == 14:
-     mobile = mobile[4:]
-    elif mobile.startswith("91") and len(mobile) == 12:
-     mobile = mobile[2:]
-
-    if not re.fullmatch(r"[6-9]\d{9}", mobile):
-     raise HTTPException(
-        status_code=400,
-        detail="Please enter a valid 10-digit Indian mobile number."
-    )
-
-    # Create the user via the ADMIN API instead of the public /signup endpoint.
-    # This does NOT send any email automatically, and gives us a clean,
-    # honest error if the email is genuinely already registered.
-    payload = {
-        "email": data.email,
-        "password": data.password,
-        "email_confirm": False,
-        "phone_confirm": False,
-        "user_metadata": {
-            "full_name": data.name,
-           "mobile": "+91" + mobile,
-        },
-    }
-
-    supa = await supabase_request(
-        "POST",
-        "admin/users",
-        json=payload,
-        access_token=SUPABASE_SECRET_KEY,
-    )
+    pw_error = validate_password_strength(data.password)
+    if pw_error:
+        raise HTTPException(
+            status_code=422,
+            detail=pw_error,
+        )
 
     try:
-        body = supa.json()
-        print("SUPABASE CREATE USER RESPONSE:", body)
-    except Exception:
-        body = {}
-
-    if supa.status_code >= 400:
-        message = friendly_supabase_error(body, "Registration failed.")
-
-        if "already" in message.lower() and "registered" in message.lower():
-            message = "An account with this email already exists. Please sign in."
-        elif "already" in message.lower() and "exists" in message.lower():
-            message = "An account with this email already exists. Please sign in."
-
-        raise HTTPException(status_code=400, detail=message)
-
-    user = body or {}
-
-    if not user.get("id"):
+        mobile = normalize_indian_mobile(data.mobile, required=True)
+    except ValueError as exc:
         raise HTTPException(
-            status_code=400,
-            detail="Registration failed. Please try again."
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+    normalized_email = str(data.email).strip().lower()
+    full_name = data.name.strip()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT email, mobile
+              FROM public.users
+             WHERE LOWER(email) = LOWER(%s)
+                OR mobile = %s
+             LIMIT 1
+            """,
+            (normalized_email, mobile),
         )
+        existing = cur.fetchone()
+        if existing:
+            if str(existing["email"]).lower() == normalized_email:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An account with this email already exists. Please sign in.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this mobile number already exists.",
+            )
+
+        password_hash = hash_password(data.password)
+        try:
+            cur.execute(
+                """
+                INSERT INTO public.users
+                  (email, full_name, mobile, password_hash, role, email_verified)
+                VALUES (%s, %s, %s, %s, 'user', FALSE)
+                RETURNING id, email, full_name, mobile, role, email_verified, account_status
+                """,
+                (normalized_email, full_name, mobile, password_hash),
+            )
+            created = cur.fetchone()
+        except UniqueViolation as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email or mobile already exists.",
+            ) from exc
+
+    user_id = str(created["id"])
+    _log_activity(conn, user_id, "user_registered", entity_id=user_id)
+    conn.commit()
 
     return {
         "success": True,
         "message": "Account created. Please verify your email.",
         "authenticated": False,
-        "user_id": user.get("id"),
+        "user_id": user_id,
+        "user": _serialize_user(created),
     }
 
-# ============================================================
-# SEND EMAIL OTP
-# ============================================================
 
 @router.post("/email-otp/send")
-async def send_email_otp(data: SendEmailOtpRequest):
-
+def send_email_otp(
+    data: SendEmailOtpRequest,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Generate a 6-character OTP, store its salted hash in otp_verifications, and email it."""
     email = str(data.email).strip().lower()
-    user_id = data.user_id.strip()
+    user = _fetch_active_user_by_id(conn, data.user_id.strip())
 
-    # --------------------------------------------------------
-    # Check that this user actually exists
-    # --------------------------------------------------------
-
-    user_resp = await supabase_request(
-        "GET",
-        f"admin/users/{user_id}",
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-    if user_resp.status_code >= 400:
+    if not user:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid registration session. Please create your account again.",
         )
 
-    try:
-        user = user_resp.json()
-    except Exception:
-        user = {}
-
-    if str(user.get("email", "")).lower() != email:
+    if str(user["email"]).lower() != email:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email does not match the registered account.",
         )
 
-    if user.get("email_confirmed_at"):
+    if user.get("email_verified"):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="This email is already verified.",
         )
 
-    # --------------------------------------------------------
-    # Check resend cooldown
-    # --------------------------------------------------------
-
-    
-    existing = await supabase_rest_request(
-        "GET",
-        "otp_verifications",
-        params={
-            "select": "created_date",
-            "user_id": f"eq.{user_id}",
-            "purpose": "eq.email_verification",
-            "order": "created_date.desc",
-            "limit": "1",
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-
-    if existing.status_code < 400:
-        try:
-            rows = existing.json()
-        except Exception:
-            rows = []
-
-        if rows:
-            created_at = datetime.fromisoformat(
-                rows[0]["created_date"].replace("Z", "+00:00")
-            )
-
-            elapsed = (
-                datetime.now(timezone.utc) - created_at
-            ).total_seconds()
-
-            if elapsed < EMAIL_OTP_RESEND_SECONDS:
-                remaining = int(
-                    EMAIL_OTP_RESEND_SECONDS - elapsed
-                )
-
+    user_id = str(user["id"])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT created_date
+              FROM public.otp_verifications
+             WHERE user_id = %s
+               AND purpose = 'email_verification'
+             ORDER BY created_date DESC
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        latest = cur.fetchone()
+        if latest and latest.get("created_date"):
+            elapsed = (datetime.now(timezone.utc) - latest["created_date"]).total_seconds()
+            if elapsed < settings.email_otp_resend_seconds:
+                remaining = int(settings.email_otp_resend_seconds - elapsed)
                 raise HTTPException(
-                    status_code=429,
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=f"Please wait {remaining} seconds before requesting another code.",
                 )
 
-    # --------------------------------------------------------
-    # Generate OTP
-    # --------------------------------------------------------
-
-    otp = generate_email_otp()
-    otp_hash = hash_email_otp(otp)
-
-    expires_at = (
-        datetime.now(timezone.utc)
-        + timedelta(minutes=EMAIL_OTP_EXPIRY_MINUTES)
-    )
-
-    # --------------------------------------------------------
-    # Delete previous OTPs for this user
-    # --------------------------------------------------------
-
-    await supabase_rest_request(
-        "DELETE",
-        "otp_verifications",
-        params={
-            "user_id": f"eq.{user_id}",
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-    # --------------------------------------------------------
-    # Store new OTP
-    # --------------------------------------------------------
-
-    
-    stored = await supabase_rest_request(
-        "POST",
-        "otp_verifications",
-        json={
-            "user_id": user_id,
-            "otp_hash": otp_hash,
-            "purpose": "email_verification",
-            "expires_at": expires_at.isoformat(),
-            "attempts": 0,
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-
-    if stored.status_code >= 400:
-        print(
-            "EMAIL OTP DB ERROR:",
-            stored.status_code,
-            stored.text,
+        otp = generate_email_otp()
+        otp_hash = hash_email_otp(otp)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=settings.email_otp_expiry_minutes
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to create the verification code.",
+        cur.execute(
+            """
+            DELETE FROM public.otp_verifications
+             WHERE user_id = %s AND purpose = 'email_verification'
+            """,
+            (user_id,),
         )
+        cur.execute(
+            """
+            INSERT INTO public.otp_verifications
+              (user_id, otp_hash, purpose, expires_at, attempts)
+            VALUES (%s, %s, 'email_verification', %s, 0)
+            """,
+            (user_id, otp_hash, expires_at),
+        )
+    conn.commit()
 
-    # --------------------------------------------------------
-    # Send email
-    # --------------------------------------------------------
-
+    body_text = (
+        "Hi,\n\n"
+        "Your Beevolve email verification code is:\n\n"
+        f"{otp}\n\n"
+        f"This code will expire in {settings.email_otp_expiry_minutes} minutes.\n\n"
+        "If you did not create a Beevolve account, you can safely ignore this email.\n\n"
+        "Regards,\nBeevolve Team\n"
+    )
     try:
-        send_email_otp_message(email, otp)
-
+        _send_smtp_email(email, "Beevolve email verification code", body_text)
     except Exception as exc:
-        print("EMAIL OTP SEND ERROR:", repr(exc))
-
-        # Do not leave a valid OTP behind if email sending failed.
-        
-        await supabase_rest_request(
-        "DELETE",
-        "otp_verifications",
-        params={
-            "user_id": f"eq.{user_id}",
-            "purpose": "eq.email_verification",
-        },
-        access_token=SUPABASE_SECRET_KEY,
-        )
-
-
+        logger.exception("Email OTP SMTP failure for user %s", user_id)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM public.otp_verifications
+                 WHERE user_id = %s AND purpose = 'email_verification'
+                """,
+                (user_id,),
+            )
+        conn.commit()
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to send the verification email. Please try again.",
-        )
+        ) from exc
 
     return {
         "success": True,
         "message": "A 6-character verification code has been sent to your email.",
     }
 
-# ============================================================
-# VERIFY EMAIL OTP
-# ============================================================
 
 @router.post("/email-otp/verify")
-async def verify_email_otp(
+def verify_email_otp(
     data: VerifyEmailOtpRequest,
-    response: Response,
+    conn: psycopg.Connection = Depends(get_db),
 ):
+    """Verify the 6-character email OTP against otp_verifications and mark user verified."""
+    import re
 
     email = str(data.email).strip().lower()
-    user_id = data.user_id.strip()
+    user = _fetch_active_user_by_id(conn, data.user_id.strip())
     code = data.code.strip().upper()
-
-    # --------------------------------------------------------
-    # Basic OTP validation
-    # --------------------------------------------------------
 
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Please enter the 6-character verification code.",
         )
 
-    # --------------------------------------------------------
-    # Get latest OTP
-    # --------------------------------------------------------
-
-    
-    otp_resp = await supabase_rest_request(
-        "GET",
-        "otp_verifications",
-        params={
-            "select": "id,otp_hash,expires_at,attempts",
-            "user_id": f"eq.{user_id}",
-            "purpose": "eq.email_verification",
-            "order": "created_date.desc",
-            "limit": "1",
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-
-    if otp_resp.status_code >= 400:
+    if not user or str(user["email"]).lower() != email:
         raise HTTPException(
-            status_code=500,
-            detail="Unable to verify the code right now.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification request.",
         )
 
-    try:
-        rows = otp_resp.json()
-    except Exception:
-        rows = []
+    user_id = str(user["id"])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, otp_hash, expires_at, attempts
+              FROM public.otp_verifications
+             WHERE user_id = %s
+               AND purpose = 'email_verification'
+             ORDER BY created_date DESC
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        otp_record = cur.fetchone()
 
-    if not rows:
+    if not otp_record:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="No active verification code found. Please request a new code.",
         )
 
-    otp_record = rows[0]
-
-    # --------------------------------------------------------
-    # Check expiry
-    # --------------------------------------------------------
-
-    expires_at = datetime.fromisoformat(
-        otp_record["expires_at"].replace("Z", "+00:00")
-    )
-
-    if datetime.now(timezone.utc) > expires_at:
-
-        await supabase_rest_request(
-            "DELETE",
-            "otp_verifications",
-            params={
-                "id": f"eq.{otp_record['id']}",
-            },
-            access_token=SUPABASE_SECRET_KEY,
-        )
-
+    if datetime.now(timezone.utc) > otp_record["expires_at"]:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.otp_verifications WHERE id = %s", (otp_record["id"],))
+        conn.commit()
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="This verification code has expired. Please request a new one.",
         )
 
-    # --------------------------------------------------------
-    # Check attempts
-    # --------------------------------------------------------
-
-    attempts = int(otp_record.get("attempts", 0))
-
-    if attempts >= EMAIL_OTP_MAX_ATTEMPTS:
+    attempts = int(otp_record["attempts"])
+    if attempts >= settings.email_otp_max_attempts:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Too many incorrect attempts. Please request a new code.",
         )
 
-    # --------------------------------------------------------
-    # Compare hashed OTP
-    # --------------------------------------------------------
-
     supplied_hash = hash_email_otp(code)
-
-    if not hmac.compare_digest(
-        supplied_hash,
-        otp_record["otp_hash"],
-    ):
-
-        await supabase_rest_request(
-            "PATCH",
-            "otp_verifications",
-            json={
-                "attempts": attempts + 1,
-            },
-            params={
-                "id": f"eq.{otp_record['id']}",
-            },
-            access_token=SUPABASE_SECRET_KEY,
+    if not hmac.compare_digest(supplied_hash, otp_record["otp_hash"]):
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.otp_verifications SET attempts = attempts + 1 WHERE id = %s",
+                (otp_record["id"],),
+            )
+        conn.commit()
+        remaining = settings.email_otp_max_attempts - attempts - 1
+        detail = (
+            "Too many incorrect attempts. Please request a new code."
+            if remaining <= 0
+            else f"Incorrect verification code. {remaining} attempts remaining."
         )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
-        remaining = EMAIL_OTP_MAX_ATTEMPTS - attempts - 1
-
-        if remaining <= 0:
-            message = "Too many incorrect attempts. Please request a new code."
-        else:
-            message = f"Incorrect verification code. {remaining} attempts remaining."
-
-        raise HTTPException(
-            status_code=400,
-            detail=message,
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.users SET email_verified = TRUE WHERE id = %s",
+            (user_id,),
         )
-
-    # --------------------------------------------------------
-    # OTP correct → confirm email
-    # --------------------------------------------------------
-
-    confirm_resp = await supabase_request(
-        "PUT",
-        f"admin/users/{user_id}",
-        json={
-            "email_confirm": True,
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-    if confirm_resp.status_code >= 400:
-        print(
-            "EMAIL CONFIRM ERROR:",
-            confirm_resp.status_code,
-            confirm_resp.text,
+        cur.execute(
+            "DELETE FROM public.otp_verifications WHERE id = %s",
+            (otp_record["id"],),
         )
-
-        raise HTTPException(
-            status_code=500,
-            detail="OTP was correct, but the email could not be verified.",
-        )
-
-    # --------------------------------------------------------
-    # Delete used OTP
-    # --------------------------------------------------------
-
-    await supabase_rest_request(
-        "DELETE",
-        "otp_verifications",
-        params={
-            "id": f"eq.{otp_record['id']}",
-        },
-        access_token=SUPABASE_SECRET_KEY,
-    )
-
-    # We intentionally do NOT try to login here using a password.
-    # The frontend will send the user to the normal login screen.
-    # --------------------------------------------------------
+    _log_activity(conn, user_id, "email_verified", entity_id=user_id)
+    conn.commit()
 
     return {
         "success": True,
@@ -638,290 +592,763 @@ async def verify_email_otp(
 
 
 @router.post("/login")
-async def login_user(
+def login_user(
     data: LoginRequest,
     request: Request,
     response: Response,
+    conn: psycopg.Connection = Depends(get_db),
 ):
-    key = get_login_key(request, str(data.email))
+    """Verify email/password via bcrypt in PostgreSQL and issue HttpOnly JWT cookies."""
+    key = _get_login_key(request, str(data.email))
     now = time.time()
+    record = _login_attempts.get(key, {"count": 0, "locked_until": 0})
 
-    record = _login_attempts.get(
-        key,
-        {"count": 0, "locked_until": 0},
-    )
-
-    if now < record["locked_until"]:
-        remaining = int(record["locked_until"] - now)
+    if now < float(record["locked_until"]):
+        remaining = int(float(record["locked_until"]) - now)
         minutes = max(1, (remaining + 59) // 60)
         raise HTTPException(
-            status_code=429,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Too many failed attempts. Try again in {minutes} minute(s).",
         )
 
-    if record["locked_until"] and now >= record["locked_until"]:
+    if record["locked_until"] and now >= float(record["locked_until"]):
         record = {"count": 0, "locked_until": 0}
 
-    supa = await supabase_request(
-        "POST",
-        "token?grant_type=password",
-        json={
-            "email": data.email,
-            "password": data.password,
-        },
-    )
-
-    try:
-        body = supa.json()
-    except Exception:
-        body = {}
-
-    if supa.status_code >= 400:
-        message = friendly_supabase_error(
-            body,
-            "Invalid email or password.",
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, email, full_name, mobile, password_hash, role,
+                   account_status, email_verified, status
+              FROM public.users
+             WHERE LOWER(email) = LOWER(%s)
+               AND deleted_at IS NULL
+             LIMIT 1
+            """,
+            (str(data.email).strip().lower(),),
         )
-        lower = message.lower()
+        user = cur.fetchone()
 
-        if "email not confirmed" in lower:
-            message = "Please verify your email before signing in."
-        elif "invalid login credentials" in lower:
-            message = "Incorrect email or password."
+    def _record_failure(detail: str) -> None:
+        record["count"] = int(record["count"]) + 1
+        if int(record["count"]) >= settings.login_max_attempts:
+            record["locked_until"] = time.time() + settings.login_lockout_seconds
+        _login_attempts[key] = record
+        if int(record["count"]) >= settings.login_max_attempts:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed attempts. Try again in 10 minutes.",
+            )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
 
-        # Count failed password attempts.
-        if "email not confirmed" not in lower:
-            record["count"] += 1
+    if not user:
+        _record_failure("Incorrect email or password.")
 
-            if record["count"] >= LOGIN_MAX_ATTEMPTS:
-                record["locked_until"] = (
-                    time.time() + LOGIN_LOCKOUT_SECONDS
-                )
+    if user["account_status"] != "active" or user["status"] != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is suspended or inactive.",
+        )
 
-            _login_attempts[key] = record
+    if not user.get("password_hash"):
+        _record_failure("This account uses Google Sign-In. Please continue with Google.")
 
-            if record["count"] >= LOGIN_MAX_ATTEMPTS:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Too many failed attempts. Try again in 10 minutes.",
-                )
+    if not verify_password(data.password, user["password_hash"]):
+        _record_failure("Incorrect email or password.")
 
-        raise HTTPException(status_code=401, detail=message)
+    if settings.require_email_verification and not user.get("email_verified"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please verify your email before signing in.",
+        )
 
-    access_token = body.get("access_token")
-    refresh_token = body.get("refresh_token")
-
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Login failed.")
-
-    # Clear the counter after a successful login.
     _login_attempts.pop(key, None)
+    access_token, raw_refresh, expires_in = _issue_session_tokens(conn, user)
+    _log_activity(conn, str(user["id"]), "user_logged_in", entity_id=str(user["id"]))
+    conn.commit()
 
-    set_session_cookies(response, access_token, refresh_token)
-
+    set_session_cookies(response, access_token, raw_refresh)
     return {
         "success": True,
         "message": "Login successful.",
         "authenticated": True,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": _serialize_user(user),
     }
 
+
 @router.get("/me")
-async def current_user(request: Request):
-    access_token = request.cookies.get("beevolve_access")
-    if not access_token:
+def current_user(
+    request: Request,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Return current session state expected by the frontend without throwing on guests."""
+    token = extract_access_token(request)
+    if not token:
         return {"authenticated": False}
 
-    supa = await supabase_request("GET", "user", access_token=access_token)
-    if supa.status_code >= 400:
+    try:
+        payload = decode_access_token(token)
+    except TokenError:
         return {"authenticated": False}
 
-    body = supa.json()
+    user = _fetch_active_user_by_id(conn, str(payload["sub"]))
+    if not user:
+        return {"authenticated": False}
+
     return {
         "authenticated": True,
         "user": {
-            "id": body.get("id"),
-            "email": body.get("email"),
-            "user_metadata": body.get("user_metadata") or {},
+            "id": str(user["id"]),
+            "email": user["email"],
+            "role": user["role"],
+            "email_verified": bool(user.get("email_verified")),
+            "user_metadata": {
+                "full_name": user.get("full_name") or "",
+                "mobile": user.get("mobile"),
+            },
         },
     }
 
+
 @router.post("/refresh")
-async def refresh_session(request: Request, response: Response):
-    refresh_token = request.cookies.get("beevolve_refresh")
-    if not refresh_token:
-        raise HTTPException(status_code=401, detail="No refresh session.")
-
-    supa = await supabase_request(
-        "POST",
-        "token?grant_type=refresh_token",
-        json={"refresh_token": refresh_token},
+def refresh_session(
+    request: Request,
+    response: Response,
+    body: RefreshRequest | None = None,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Rotate refresh token stored in PostgreSQL and issue fresh HttpOnly cookies."""
+    raw_token = request.cookies.get(settings.refresh_cookie_name) or (
+        body.refresh_token if body else None
     )
-    try:
-        body = supa.json()
-    except Exception:
-        body = {}
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No refresh session.",
+        )
 
-    if supa.status_code >= 400:
+    token_hash = hash_refresh_token(raw_token)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT rt.id, rt.user_id, rt.revoked, rt.expires_at,
+                   u.email, u.full_name, u.mobile, u.role,
+                   u.account_status, u.email_verified, u.deleted_at, u.status
+              FROM public.refresh_tokens rt
+              JOIN public.users u ON u.id = rt.user_id
+             WHERE rt.token_hash = %s
+             LIMIT 1
+               FOR UPDATE OF rt
+            """,
+            (token_hash,),
+        )
+        row = cur.fetchone()
+
+    if not row:
         clear_session_cookies(response)
-        raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Please sign in again.",
+        )
 
-    set_session_cookies(response, body["access_token"], body.get("refresh_token"))
-    return {"success": True, "authenticated": True}
+    if row["revoked"]:
+        # Reuse detected: revoke every active refresh token for this user.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.refresh_tokens SET revoked = TRUE WHERE user_id = %s",
+                (row["user_id"],),
+            )
+        conn.commit()
+        clear_session_cookies(response)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token reuse detected. Please sign in again.",
+        )
+
+    if (
+        datetime.now(timezone.utc) > row["expires_at"]
+        or row["deleted_at"] is not None
+        or row["account_status"] != "active"
+        or row["status"] != "active"
+    ):
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.refresh_tokens SET revoked = TRUE WHERE id = %s",
+                (row["id"],),
+            )
+        conn.commit()
+        clear_session_cookies(response)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired. Please sign in again.",
+        )
+
+    new_access, expires_in = create_access_token(
+        user_id=str(row["user_id"]),
+        email=str(row["email"]),
+        role=str(row.get("role", "user")),
+    )
+    new_raw_refresh = generate_refresh_token()
+    new_hash = hash_refresh_token(new_raw_refresh)
+    new_expires_at = datetime.now(timezone.utc) + timedelta(
+        days=settings.refresh_token_expire_days
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.refresh_tokens (user_id, token_hash, expires_at)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (row["user_id"], new_hash, new_expires_at),
+        )
+        new_rt = cur.fetchone()
+        cur.execute(
+            """
+            UPDATE public.refresh_tokens
+               SET revoked = TRUE, replaced_by_id = %s
+             WHERE id = %s
+            """,
+            (new_rt["id"], row["id"]),
+        )
+    conn.commit()
+
+    set_session_cookies(response, new_access, new_raw_refresh)
+    return {
+        "success": True,
+        "authenticated": True,
+        "expires_in": expires_in,
+    }
+
 
 @router.post("/logout")
-async def logout(request: Request, response: Response):
-    access_token = request.cookies.get("beevolve_access")
-    if access_token:
-        await supabase_request("POST", "logout", access_token=access_token)
+def logout(
+    request: Request,
+    response: Response,
+    body: RefreshRequest | None = None,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Revoke refresh token in PostgreSQL and clear HttpOnly cookies."""
+    raw_refresh = request.cookies.get(settings.refresh_cookie_name) or (
+        body.refresh_token if body else None
+    )
+    if raw_refresh:
+        token_hash = hash_refresh_token(raw_refresh)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.refresh_tokens SET revoked = TRUE WHERE token_hash = %s",
+                (token_hash,),
+            )
+        conn.commit()
+
     clear_session_cookies(response)
     return {"success": True}
 
+
 @router.post("/forgot-password")
-async def forgot_password(data: ForgotPasswordRequest):
-    redirect_to = f"{FRONTEND_URL}/reset-password.html"
-    supa = await supabase_request(
-    "POST",
-    "recover",
-    params={"redirect_to": redirect_to},
-    json={"email": data.email},
-
-    )
-    if supa.status_code >= 400:
-        try:
-            body = supa.json()
-        except Exception:
-            body = {}
-        raise HTTPException(
-            status_code=400,
-            detail=friendly_supabase_error(body, "Unable to send password reset email."),
+def forgot_password(
+    data: ForgotPasswordRequest,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Send a self-hosted signed password reset link via Gmail SMTP."""
+    email = str(data.email).strip().lower()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, email, full_name
+              FROM public.users
+             WHERE LOWER(email) = LOWER(%s)
+               AND deleted_at IS NULL
+               AND account_status = 'active'
+               AND status = 'active'
+             LIMIT 1
+            """,
+            (email,),
         )
-    return {"success": True, "message": "If the account exists, a password reset email has been sent."}
+        user = cur.fetchone()
 
-@router.get("/oauth/google")
-async def google_oauth():
-    params = urlencode({
-        "provider": "google",
-        "redirect_to": f"{FRONTEND_URL}/oauth-callback.html",
-    })
-    # The authorize endpoint accepts the project API key as a header, not in the
-    # browser. The frontend receives only the resulting URL.
+    if user:
+        reset_token = create_reset_token(str(user["id"]), str(user["email"]))
+        reset_link = f"{settings.frontend_url}/reset-password.html?token={reset_token}"
+        name = user.get("full_name") or "there"
+        body_text = (
+            f"Hi {name},\n\n"
+            "We received a request to reset your Beevolve password.\n\n"
+            f"Open this link to set a new password (valid for {settings.password_reset_expire_minutes} minutes):\n"
+            f"{reset_link}\n\n"
+            "If you did not request this change, you can safely ignore this email.\n\n"
+            "Regards,\nBeevolve Team\n"
+        )
+        try:
+            _send_smtp_email(email, "Reset your Beevolve password", body_text)
+        except Exception as exc:
+            logger.exception("Forgot password SMTP error for %s", email)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Unable to send password reset email right now.",
+            ) from exc
+
     return {
-        "url": f"{SUPABASE_URL.rstrip('/')}/auth/v1/authorize?{params}",
+        "success": True,
+        "message": "If the account exists, a password reset email has been sent.",
     }
 
-@router.get("/oauth/microsoft")
-async def microsoft_oauth():
-    params = urlencode({
-        "provider": "azure",
-        "redirect_to": f"{FRONTEND_URL}/oauth-callback.html",
-    })
-    return {
-        "url": f"{SUPABASE_URL.rstrip('/')}/auth/v1/authorize?{params}",
-    }
 
 @router.post("/oauth/exchange")
-async def oauth_exchange(data: OAuthExchangeRequest, response: Response):
-    # OAuth providers return tokens in the URL fragment for the implicit flow.
-    # The frontend sends them once to this backend endpoint; the backend immediately
-    # converts them into HttpOnly cookies and the token values are never persisted.
-    supa = await supabase_request("GET", "user", access_token=data.access_token)
-    if supa.status_code >= 400:
-        raise HTTPException(status_code=401, detail="OAuth authentication failed.")
+def oauth_exchange(data: OAuthExchangeRequest, response: Response):
+    """Convert a password-reset or access token into HttpOnly cookies."""
+    # Try dedicated password-reset token first so reset links never grant API login cookies.
+    try:
+        decode_reset_token(data.access_token)
+        response.set_cookie(
+            settings.reset_cookie_name,
+            data.access_token,
+            max_age=settings.password_reset_expire_minutes * 60,
+            **_cookie_kwargs(),
+        )
+        return {"success": True, "authenticated": False, "reset_session": True}
+    except TokenError:
+        pass
 
-    set_session_cookies(response, data.access_token, data.refresh_token)
+    try:
+        decode_access_token(data.access_token)
+    except TokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token is invalid or expired.",
+        ) from exc
+
+    set_session_cookies(response, data.access_token, None)
     return {"success": True, "authenticated": True}
 
 
 @router.post("/update-password")
-async def update_password(data: UpdatePasswordRequest, request: Request, response: Response):
-    access_token = request.cookies.get("beevolve_access")
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Password reset session expired. Please request a new reset email.")
-
-    supa = await supabase_request(
-        "PUT",
-        "user",
-        json={"password": data.password},
-        access_token=access_token,
-    )
-    if supa.status_code >= 400:
-        try:
-            body = supa.json()
-        except Exception:
-            body = {}
+def update_password(
+    data: UpdatePasswordRequest,
+    request: Request,
+    response: Response,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Update password in PostgreSQL using a reset session or active user session."""
+    pw_error = validate_password_strength(data.password)
+    if pw_error:
         raise HTTPException(
-            status_code=400,
-            detail=friendly_supabase_error(body, "Unable to update password."),
+            status_code=422,
+            detail=pw_error,
         )
 
+    user_id: str | None = None
+    reset_token = data.token or request.cookies.get(settings.reset_cookie_name)
+    if reset_token:
+        try:
+            payload = decode_reset_token(reset_token)
+            user_id = str(payload["sub"])
+        except TokenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Password reset session expired. Please request a new reset email.",
+            ) from exc
+    else:
+        access_token = extract_access_token(request)
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Password reset session expired. Please request a new reset email.",
+            )
+        try:
+            payload = decode_access_token(access_token)
+            user_id = str(payload["sub"])
+        except TokenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired. Please sign in again.",
+            ) from exc
+
+    user = _fetch_active_user_by_id(conn, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account not found or inactive.",
+        )
+
+    new_hash = hash_password(data.password)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.users SET password_hash = %s WHERE id = %s",
+            (new_hash, user_id),
+        )
+        cur.execute(
+            "UPDATE public.refresh_tokens SET revoked = TRUE WHERE user_id = %s",
+            (user_id,),
+        )
+    _log_activity(conn, user_id, "password_updated", entity_id=user_id)
+    conn.commit()
+
+    response.delete_cookie(settings.reset_cookie_name, path="/")
     return {"success": True, "message": "Password updated successfully."}
 
-@router.get("/profile")
-async def profile(request: Request):
-    access_token = request.cookies.get("beevolve_access")
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    
-    supa = await supabase_rest_request(
-    "GET",
-    "users",
-    access_token=access_token,
-    params={
-        "select": "id,email,full_name,mobile,created_at:created_date,updated_at:updated_date",
-        "id": "eq." + (await _user_id(access_token)),
-        "limit": "1",
-      },
+def _upsert_google_user(
+    conn: psycopg.Connection,
+    *,
+    google_sub: str,
+    email: str,
+    full_name: str,
+    email_verified: bool,
+) -> dict[str, Any]:
+    """Find or create user + oauth_accounts row inside PostgreSQL."""
+    normalized_email = email.strip().lower()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT u.id, u.email, u.full_name, u.mobile, u.role,
+                   u.account_status, u.email_verified, u.deleted_at, u.status
+              FROM public.oauth_accounts oa
+              JOIN public.users u ON u.id = oa.user_id
+             WHERE oa.provider = 'google'
+               AND oa.provider_user_id = %s
+             LIMIT 1
+            """,
+            (google_sub,),
+        )
+        user = cur.fetchone()
+
+        if user:
+            if (
+                user["deleted_at"] is not None
+                or user["account_status"] != "active"
+                or user["status"] != "active"
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is suspended or deleted.",
+                )
+            return user
+
+        cur.execute(
+            """
+            SELECT id, email, full_name, mobile, role,
+                   account_status, email_verified, deleted_at, status
+              FROM public.users
+             WHERE LOWER(email) = LOWER(%s)
+             LIMIT 1
+            """,
+            (normalized_email,),
+        )
+        user = cur.fetchone()
+
+        if user:
+            if (
+                user["deleted_at"] is not None
+                or user["account_status"] != "active"
+                or user["status"] != "active"
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is suspended or deleted.",
+                )
+            if (email_verified and not user["email_verified"]) or (
+                full_name and not user.get("full_name")
+            ):
+                cur.execute(
+                    """
+                    UPDATE public.users
+                       SET email_verified = email_verified OR %s,
+                           full_name = CASE WHEN full_name = '' THEN %s ELSE full_name END
+                     WHERE id = %s
+                    RETURNING id, email, full_name, mobile, role,
+                              account_status, email_verified, status
+                    """,
+                    (email_verified, full_name, user["id"]),
+                )
+                user = cur.fetchone()
+        else:
+            cur.execute(
+                """
+                INSERT INTO public.users
+                  (email, full_name, password_hash, role, email_verified)
+                VALUES (%s, %s, NULL, 'user', %s)
+                RETURNING id, email, full_name, mobile, role,
+                          account_status, email_verified, status
+                """,
+                (normalized_email, full_name, email_verified),
+            )
+            user = cur.fetchone()
+
+        cur.execute(
+            """
+            INSERT INTO public.oauth_accounts (user_id, provider, provider_user_id)
+            VALUES (%s, 'google', %s)
+            ON CONFLICT (provider, provider_user_id) DO NOTHING
+            """,
+            (user["id"], google_sub),
+        )
+    return user
+
+
+def _verify_google_id_token_claims(raw_id_token: str) -> dict[str, Any]:
+    if not settings.google_client_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GOOGLE_CLIENT_ID is not configured in Backend/.env.",
+        )
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            raw_id_token,
+            google_requests.Request(),
+            settings.google_client_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid Google ID token: {exc}",
+        ) from exc
+
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Google token issuer.",
+        )
+    if not claims.get("sub") or not claims.get("email"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google token is missing required user identity fields.",
+        )
+    return claims
+
+
+@router.get("/oauth/google")
+def google_oauth():
+    """Return Google OAuth 2.0 consent URL for the frontend redirect flow."""
+    if not settings.google_client_id or not settings.google_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth is not configured in Backend/.env.",
+        )
+
+    params = urlencode(
+        {
+            "client_id": settings.google_client_id,
+            "redirect_uri": settings.google_redirect_uri,
+            "response_type": "code",
+            "scope": settings.google_scopes,
+            "state": create_oauth_state("google"),
+            "access_type": "offline",
+            "prompt": "select_account",
+        }
+    )
+    return {"url": f"{settings.google_auth_url}?{params}"}
+
+
+@router.get("/oauth/google/callback")
+def google_oauth_callback(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Handle Google OAuth redirect, persist user/oauth_account in PostgreSQL, set HttpOnly cookies."""
+    if error or not code or not state or not verify_oauth_state(state, "google"):
+        return RedirectResponse(
+            url=f"{settings.frontend_url}/index.html?oauth_error=google_auth_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    try:
+        token_resp = httpx.post(
+            settings.google_token_url,
+            data={
+                "code": code,
+                "client_id": settings.google_client_id,
+                "client_secret": settings.google_client_secret,
+                "redirect_uri": settings.google_redirect_uri,
+                "grant_type": "authorization_code",
+            },
+            timeout=15.0,
+        )
+        token_data = token_resp.json()
+    except Exception:
+        logger.exception("Google token exchange request failed")
+        return RedirectResponse(
+            url=f"{settings.frontend_url}/index.html?oauth_error=google_exchange_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    if token_resp.status_code >= 400 or not token_data.get("id_token"):
+        logger.warning("Google token exchange error: %s", token_data)
+        return RedirectResponse(
+            url=f"{settings.frontend_url}/index.html?oauth_error=google_exchange_failed",
+            status_code=status.HTTP_302_FOUND,
+        )
+
+    claims = _verify_google_id_token_claims(token_data["id_token"])
+    user = _upsert_google_user(
+        conn,
+        google_sub=str(claims["sub"]),
+        email=str(claims["email"]),
+        full_name=str(claims.get("name") or ""),
+        email_verified=bool(claims.get("email_verified", False)),
+    )
+    access_token, raw_refresh, _ = _issue_session_tokens(conn, user)
+    _log_activity(conn, str(user["id"]), "oauth_google_login", entity_id=str(user["id"]))
+    conn.commit()
+
+    redirect = RedirectResponse(
+        url=f"{settings.frontend_url}/dashboard.html",
+        status_code=status.HTTP_302_FOUND,
+    )
+    set_session_cookies(redirect, access_token, raw_refresh)
+    return redirect
+
+
+@router.post("/google")
+def google_id_token_login(
+    data: GoogleIdTokenRequest,
+    response: Response,
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Verify a Google ID token directly (Postman / One Tap) and set HttpOnly cookies."""
+    claims = _verify_google_id_token_claims(data.id_token)
+    user = _upsert_google_user(
+        conn,
+        google_sub=str(claims["sub"]),
+        email=str(claims["email"]),
+        full_name=str(claims.get("name") or ""),
+        email_verified=bool(claims.get("email_verified", False)),
+    )
+    access_token, raw_refresh, expires_in = _issue_session_tokens(conn, user)
+    _log_activity(conn, str(user["id"]), "oauth_google_login", entity_id=str(user["id"]))
+    conn.commit()
+
+    set_session_cookies(response, access_token, raw_refresh)
+    return {
+        "success": True,
+        "authenticated": True,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": _serialize_user(user),
+    }
+
+
+@router.get("/oauth/microsoft")
+def microsoft_oauth():
+    """Explicitly report that Microsoft OAuth is not configured after Supabase removal."""
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Microsoft OAuth is not configured yet in standalone PostgreSQL mode. "
+            "Please sign in with email or Google."
+        ),
     )
 
 
-    if supa.status_code >= 400:
-        raise HTTPException(status_code=supa.status_code, detail="Unable to load profile.")
+@router.get("/profile")
+def profile(
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Return the logged-in user's profile row from PostgreSQL."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, email, full_name, mobile, role, email_verified,
+                   created_date AS created_at, updated_date AS updated_at
+              FROM public.users
+             WHERE id = %s
+             LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
 
-    rows = supa.json()
-    return {"profile": rows[0] if rows else None}
+    if not row:
+        return {"profile": None}
+
+    return {
+        "profile": {
+            "id": str(row["id"]),
+            "email": row["email"],
+            "full_name": row["full_name"],
+            "mobile": row["mobile"],
+            "role": row["role"],
+            "email_verified": row["email_verified"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        }
+    }
+
 
 @router.put("/profile")
-async def update_profile(data: UpdateProfileRequest, request: Request):
-    access_token = request.cookies.get("beevolve_access")
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Not authenticated.")
+def update_profile(
+    data: UpdateProfileRequest,
+    user_id: str = Depends(get_current_user_id),
+    conn: psycopg.Connection = Depends(get_db),
+):
+    """Update the authenticated user's profile in PostgreSQL."""
+    normalized_email = str(data.email).strip().lower()
+    full_name = data.full_name.strip()
 
-    user_id = await _user_id(access_token)
-    auth_update = await supabase_request(
-        "PUT",
-        "user",
-        json={
-            "email": str(data.email),
-            "data": {"full_name": data.full_name, "mobile": data.mobile},
+    try:
+        mobile = normalize_indian_mobile(data.mobile, required=False)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, email, mobile
+              FROM public.users
+             WHERE id <> %s
+               AND (LOWER(email) = LOWER(%s) OR (%s IS NOT NULL AND mobile = %s))
+             LIMIT 1
+            """,
+            (user_id, normalized_email, mobile, mobile),
+        )
+        conflict = cur.fetchone()
+        if conflict:
+            if str(conflict["email"]).lower() == normalized_email:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="That email address is already in use.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="That mobile number is already in use.",
+            )
+
+        cur.execute(
+            """
+            UPDATE public.users
+               SET email = %s,
+                   full_name = %s,
+                   mobile = %s
+             WHERE id = %s
+            RETURNING id, email, full_name, mobile, role, email_verified,
+                      created_date AS created_at, updated_date AS updated_at
+            """,
+            (normalized_email, full_name, mobile, user_id),
+        )
+        updated = cur.fetchone()
+
+    _log_activity(conn, user_id, "profile_updated", entity_id=user_id)
+    conn.commit()
+
+    return {
+        "success": True,
+        "message": "Profile updated successfully.",
+        "profile": {
+            "id": str(updated["id"]),
+            "email": updated["email"],
+            "full_name": updated["full_name"],
+            "mobile": updated["mobile"],
+            "role": updated["role"],
+            "email_verified": updated["email_verified"],
+            "created_at": updated["created_at"].isoformat() if updated["created_at"] else None,
+            "updated_at": updated["updated_at"].isoformat() if updated["updated_at"] else None,
         },
-        access_token=access_token,
-    )
-    if auth_update.status_code >= 400:
-        try:
-            body = auth_update.json()
-        except Exception:
-            body = {}
-        raise HTTPException(status_code=400, detail=friendly_supabase_error(body, "Unable to update account details."))
-
-    
-    profile_update = await supabase_rest_request(
-        "PATCH",
-        "users",
-        json={
-            "full_name": data.full_name,
-            "mobile": data.mobile,
-        },
-        access_token=access_token,
-        params={"id": "eq." + user_id},
-    )
-
-    if profile_update.status_code >= 400:
-        raise HTTPException(status_code=profile_update.status_code, detail="Unable to update profile.")
-
-    return {"success": True, "message": "Profile updated successfully. Check your email if confirmation is required."}
-
-async def _user_id(access_token: str) -> str:
-    supa = await supabase_request("GET", "user", access_token=access_token)
-    if supa.status_code >= 400:
-        raise HTTPException(status_code=401, detail="Not authenticated.")
-    return supa.json()["id"]
+    }

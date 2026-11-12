@@ -1,0 +1,2 @@
+$kind: collection
+description: Step-by-step API collection for Registration, Login, JWT Expiry/Refresh, Google Auth, and Authorization.
