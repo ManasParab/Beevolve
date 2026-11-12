@@ -498,6 +498,7 @@ def send_email_otp(
 @router.post("/email-otp/verify")
 def verify_email_otp(
     data: VerifyEmailOtpRequest,
+    response: Response,
     conn: psycopg.Connection = Depends(get_db),
 ):
     """Verify the 6-character email OTP against otp_verifications and mark user verified."""
@@ -581,13 +582,26 @@ def verify_email_otp(
             "DELETE FROM public.otp_verifications WHERE id = %s",
             (otp_record["id"],),
         )
+    user["email_verified"] = True
+    access_token, raw_refresh, expires_in = _issue_session_tokens(conn, user)
     _log_activity(conn, user_id, "email_verified", entity_id=user_id)
+    _log_activity(
+        conn,
+        user_id,
+        "user_logged_in",
+        entity_id=user_id,
+        metadata={"via": "email_otp"},
+    )
     conn.commit()
 
+    set_session_cookies(response, access_token, raw_refresh)
     return {
         "success": True,
-        "authenticated": False,
-        "message": "Email verified successfully. You can now sign in.",
+        "authenticated": True,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": _serialize_user(user),
+        "message": "Email verified! Signing you in…",
     }
 
 

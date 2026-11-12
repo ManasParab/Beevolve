@@ -64,7 +64,7 @@ PostgreSQL Database (beevolve_auth on localhost:5432)
 | :--- | :--- | :--- |
 | `POST /api/auth/register` | `register_user` | Validates Terms acceptance, password match (`confirm_password`), password strength, and 10-digit Indian mobile (`+91`). Checks `users` for duplicate email/mobile (`409`). Hashes password with `bcrypt`, saves user (`201 Created`), and returns `user_id` for the OTP screen. |
 | `POST /api/auth/email-otp/send` | `send_email_otp` | Enforces resend cooldown, creates a 6-character code, stores its salted SHA-256 hash in `otp_verifications`, and emails it via Gmail SMTP. |
-| `POST /api/auth/email-otp/verify` | `verify_email_otp` | Checks OTP expiry and max wrong attempts (`5`), verifies hash with constant-time compare, marks `users.email_verified = TRUE`, and deletes the used OTP. |
+| `POST /api/auth/email-otp/verify` | `verify_email_otp` | Checks OTP expiry and max wrong attempts (`5`), verifies hash with constant-time compare, marks `users.email_verified = TRUE`, deletes the used OTP, creates JWT + refresh token in `refresh_tokens`, and sets HttpOnly `beevolve_access` & `beevolve_refresh` cookies so the user logs in directly. |
 | `POST /api/auth/login` | `login_user` | Enforces 5-attempt / 10-minute brute-force lockout (`429`), checks `bcrypt` password hash against `users.password_hash`, creates JWT + refresh token in `refresh_tokens`, and sets HttpOnly `beevolve_access` & `beevolve_refresh` cookies. |
 | `GET /api/auth/me` | `current_user` | Checks the caller's cookie/Bearer JWT without raising errors for guests; returns `{authenticated: false}` or `{authenticated: true, user: {...}}` for page-load checks. |
 | `POST /api/auth/refresh` | `refresh_session` | Reads `beevolve_refresh` cookie (or body token), checks `refresh_tokens`, detects reuse (if a revoked token is replayed, revokes **all** sessions for that user!), otherwise issues a brand-new access + refresh token pair and rotates the DB record. |
@@ -94,6 +94,7 @@ PostgreSQL Database (beevolve_auth on localhost:5432)
 
 | Method & URL | Function | What it does |
 | :--- | :--- | :--- |
+| `GET /api/subscriptions/plans` | `list_active_plans` | Returns all active services and their live database prices (`amount_paise` and `amount_rupees`) from `mst_plan` + `mst_product` so `subscriptions.html` and `checkout.html` always reflect DB updates. |
 | `POST /api/subscriptions/create` | `create_subscription` | Looks up an autopay-enabled plan (`provider_plan_id IS NOT NULL`) by `plan_id` or `service` fallback, records an `e-mandate` row in `orders` + `order_items`, and creates a Razorpay subscription returning its `short_url`. |
 | `GET /api/subscriptions/me` | `get_my_subscriptions` | Loads all subscriptions for the logged-in user joined with `mst_plan` and `mst_product` so `dashboard.html` can show each service name, status, amount, start/expiry dates, and auto-renew state. |
 | `GET /api/subscriptions/access/{product_id}` | `check_product_access` | Checks `public.subscriptions` to return `{has_access: true/false}` based on active status and `starts_at <= now < expires_at`. |
@@ -125,12 +126,12 @@ PostgreSQL Database (beevolve_auth on localhost:5432)
 
 | File | What it does (in simple words) |
 | :--- | :--- |
-| **`Frontend/index.html`** | Main login & signup screen: Login tab, Create Account tab (Name, Mobile, Email, Password, Confirm Password, Terms checkbox), Forgot Password form, Gmail 6-character OTP verification box, and Google / Microsoft buttons. |
+| **`Frontend/index.html`** | Main login & signup screen: Login tab, Create Account tab (Name, Mobile, Email, Password, Confirm Password, Terms checkbox), Forgot Password form, Gmail 6-character OTP verification box, and Continue with Google button. |
 | **`Frontend/js/auth.js`** | Frontend controller for `index.html`. Validates forms in the browser, sends `fetch(..., { credentials: "include" })` requests to `http://127.0.0.1:8000/api/auth/*`, manages OTP cooldown timer, handles Google OAuth redirects/errors, and redirects signed-in users to `dashboard.html`. |
 | **`Frontend/dashboard.html`** | Protected user workspace. Calls `/api/auth/me`, `/api/subscriptions/me`, and `/api/auth/profile` on load; displays purchased services (`Career Toolkit`, etc.), lets users edit and save their name/email/mobile (`PUT /api/auth/profile`), provides Resume Builder / Interview Prep / Notes Taker workspace cards, and handles Logout. |
-| **`Frontend/subscriptions.html`** | Catalog of paid services (`Career Toolkit` Rs. 499, `Portfolio Review` Rs. 299, `Career Roadmap` Rs. 199). Clicking Buy opens `checkout.html` with the selected service, amount, and plan ID. |
-| **`Frontend/checkout.html`** | Payment screen. Supports both **One-Time Payment** (`/api/payments/create-order` + Razorpay popup + `/api/payments/verify`) and optional **Autopay** (`/api/subscriptions/create` redirect). |
-| **`Frontend/reset-password.html`** | Password reset form reached from the email link (`?token=...`). Sends the reset token once to `/api/auth/oauth/exchange` to receive an HttpOnly `beevolve_reset` cookie, then posts the new password to `/api/auth/update-password`. |
+| **`Frontend/subscriptions.html`** | Catalog of paid services (`Career Toolkit`, `Portfolio Review`, `Career Roadmap`). Dynamically fetches live prices and plan IDs from `GET /api/subscriptions/plans` (`mst_plan`) so changing a price in PostgreSQL updates the page immediately. |
+| **`Frontend/checkout.html`** | Payment screen. Fetches live pricing from `GET /api/subscriptions/plans` and supports both **One-Time Payment** (`/api/payments/create-order` + Razorpay popup + `/api/payments/verify`) and optional **Autopay** (`/api/subscriptions/create` redirect). |
+| **`Frontend/reset-password.html`** | Redesigned BeEvolve-themed password reset form reached from the email link (`?token=...`), with password visibility toggles and live strength meter. Sends the reset token once to `/api/auth/oauth/exchange` to receive an HttpOnly `beevolve_reset` cookie, then posts the new password to `/api/auth/update-password`. |
 | **`Frontend/oauth-callback.html`** | Legacy implicit-grant callback page from Supabase OAuth. (Direct Google OAuth now sets HttpOnly cookies on the backend callback and lands directly on `dashboard.html`.) |
 | **`Frontend/css/styles.css`** | All styling, layout, toasts, responsive grids, and typography across every HTML page. |
 | **`Frontend/assets/hero.mp4`** | Background hero video displayed on the authentication page. |

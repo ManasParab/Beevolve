@@ -206,15 +206,15 @@
           </p>
 
           <div class="plan-price">
-            Rs. 499 <small>/ one time</small>
+            Loading price...
           </div>
 
           <button
             type="button"
             class="btn-primary buy-service"
             data-service="Career Toolkit"
-            data-amount="499"
-            data-plan-id="61af1c9e-ba0f-4a83-ac8d-e95773a13b04">
+            data-plan-id=""
+            disabled>
             Buy toolkit <span aria-hidden="true">-&gt;</span>
           </button>
         </article>
@@ -229,15 +229,15 @@
           </p>
 
           <div class="plan-price">
-            Rs. 299 <small>/ one time</small>
+            Loading price...
           </div>
 
           <button
             type="button"
             class="btn-primary buy-service"
             data-service="Portfolio Review"
-            data-amount="299"
-            data-plan-id="c27ffd2c-eeb8-40a6-86f8-38eea10b7446">
+            data-plan-id=""
+            disabled>
             Buy service <span aria-hidden="true">-&gt;</span>
           </button>
         </article>
@@ -252,15 +252,15 @@
           </p>
 
           <div class="plan-price">
-            Rs. 199 <small>/ one time</small>
+            Loading price...
           </div>
 
           <button
             type="button"
             class="btn-primary buy-service"
             data-service="Career Roadmap"
-            data-amount="199"
-            data-plan-id="8a4d8288-d4fd-43d9-8f50-af1efc13c98b">
+            data-plan-id=""
+            disabled>
             Buy service <span aria-hidden="true">-&gt;</span>
           </button>
         </article>
@@ -281,7 +281,52 @@
 
       Keep this on "one_time" until Priyal's setup is ready.
     */
+    const API_BASE = "http://127.0.0.1:8000";
     const PAYMENT_MODE = "one_time";
+
+    async function loadPlansFromDatabase() {
+      const cards = document.querySelectorAll(".plan");
+      try {
+        const response = await fetch(`${API_BASE}/api/subscriptions/plans`, {
+          cache: "no-store"
+        });
+        if (!response.ok) {
+          throw new Error("Unable to load service pricing.");
+        }
+        const data = await response.json();
+        const plansByName = new Map(
+          (data.plans || []).map(plan => [String(plan.name).toLowerCase(), plan])
+        );
+
+        cards.forEach(card => {
+          const button = card.querySelector(".buy-service");
+          const priceEl = card.querySelector(".plan-price");
+          if (!button || !priceEl) return;
+
+          const serviceName = String(button.dataset.service || "").trim();
+          const plan = plansByName.get(serviceName.toLowerCase());
+          if (!plan) {
+            priceEl.textContent = "Unavailable";
+            button.disabled = true;
+            return;
+          }
+
+          priceEl.innerHTML = `Rs. ${plan.amount_rupees} <small>/ one time</small>`;
+          button.dataset.amount = String(plan.amount_rupees);
+          button.dataset.planId = plan.plan_id;
+          button.disabled = false;
+        });
+      } catch (error) {
+        cards.forEach(card => {
+          const priceEl = card.querySelector(".plan-price");
+          const button = card.querySelector(".buy-service");
+          if (priceEl) priceEl.textContent = "Price unavailable";
+          if (button) button.disabled = true;
+        });
+      }
+    }
+
+    loadPlansFromDatabase();
 
     document.querySelectorAll(".buy-service").forEach(button => {
       button.addEventListener("click", async () => {
@@ -300,6 +345,7 @@
 
         // Recurring subscription flow retained for later
         const planId = button.dataset.planId;
+        const service = button.dataset.service;
         const originalText = button.innerText;
 
         document.querySelectorAll(".buy-service").forEach(item => {
@@ -310,7 +356,7 @@
 
         try {
           const response = await fetch(
-            "http://127.0.0.1:8000/api/subscriptions/create",
+            `${API_BASE}/api/subscriptions/create`,
             {
               method: "POST",
               credentials: "include",
@@ -318,7 +364,8 @@
                 "Content-Type": "application/json"
               },
               body: JSON.stringify({
-                plan_id: planId
+                plan_id: planId,
+                service
               })
             }
           );

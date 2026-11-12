@@ -567,10 +567,10 @@ ON CONFLICT (slug) DO NOTHING;
 INSERT INTO public.mst_plan (id, product_id, plan_interval, duration_days, amount, currency)
 SELECT v.plan_uuid, p.id, v.plan_interval, v.duration_days, v.amount, 'INR'
   FROM (VALUES
-    ('61af1c9e-ba0f-4a83-ac8d-e95773a13b04'::uuid, 'career-toolkit',   'annual',  365, 49900),
-    ('c27ffd2c-eeb8-40a6-86f8-38eea10b7446'::uuid, 'portfolio-review', 'annual',  365, 29900),
-    ('8a4d8288-d4fd-43d9-8f50-af1efc13c98b'::uuid, 'career-roadmap',   'annual',  365, 19900),
-    (gen_random_uuid(),                            'beevolve-premium', 'monthly',  30, 50000)
+    ('61af1c9e-ba0f-4a83-ac8d-e95773a13b04'::uuid, 'career-toolkit',   'annual',  365, 100),
+    ('c27ffd2c-eeb8-40a6-86f8-38eea10b7446'::uuid, 'portfolio-review', 'annual',  365, 100),
+    ('8a4d8288-d4fd-43d9-8f50-af1efc13c98b'::uuid, 'career-roadmap',   'annual',  365, 100),
+    (gen_random_uuid(),                            'beevolve-premium', 'monthly',  30, 100)
   ) AS v(plan_uuid, slug, plan_interval, duration_days, amount)
   JOIN public.mst_product p ON p.slug = v.slug
  WHERE NOT EXISTS (SELECT 1 FROM public.mst_plan x WHERE x.product_id = p.id);

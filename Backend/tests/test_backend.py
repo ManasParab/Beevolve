@@ -74,7 +74,7 @@ class InMemoryStore:
             "product_id": toolkit_prod,
             "plan_interval": "annual",
             "duration_days": 365,
-            "amount": 49900,
+            "amount": 100,
             "currency": "INR",
             "provider_plan_id": "plan_rzp_toolkit",
             "status": "active",
@@ -346,6 +346,24 @@ class FakeCursor:
             return
 
         # Plans / Products / Coupons
+        if "SELECT pl.id AS plan_id" in q and "FROM public.mst_plan pl JOIN public.mst_product pr" in q:
+            for pl in self.store.plans.values():
+                pr = self.store.products[pl["product_id"]]
+                if pl["status"] == "active" and pr["status"] == "active" and pr["is_active"]:
+                    self._many.append({
+                        "plan_id": pl["id"],
+                        "product_id": pl["product_id"],
+                        "slug": pr["slug"],
+                        "name": pr["name"],
+                        "category": pr["category"],
+                        "plan_interval": pl["plan_interval"],
+                        "duration_days": pl["duration_days"],
+                        "amount_paise": pl["amount"],
+                        "currency": pl["currency"],
+                        "provider_plan_id": pl["provider_plan_id"],
+                    })
+            return
+
         if "FROM public.mst_plan pl JOIN public.mst_product pr" in q and "LOWER(pr.name) = LOWER(%s)" in q:
             target = params[0].lower()
             for pl in self.store.plans.values():
@@ -632,12 +650,22 @@ class TestBeEvolvePostgresBackend(unittest.TestCase):
             )
         self.assertTrue(otp_resp["success"])
         self.assertEqual(len(sent_otps), 1)
+        otp_res = Response()
         verified = auth_routes.verify_email_otp(
             auth_routes.VerifyEmailOtpRequest(email="tanay@example.com", user_id=user_id, code="AB34XY"),
+            otp_res,
             self.conn,
         )
         self.assertTrue(verified["success"])
+        self.assertTrue(verified["authenticated"])
         self.assertTrue(self.store.users[user_id]["email_verified"])
+        otp_cookies = [v.decode("latin-1") for k, v in otp_res.raw_headers if k.lower() == b"set-cookie"]
+        self.assertEqual(len(otp_cookies), 2)
+        self.assertTrue(any("beevolve_access=" in c and "HttpOnly" in c for c in otp_cookies))
+        self.assertTrue(any("beevolve_refresh=" in c and "HttpOnly" in c for c in otp_cookies))
+        otp_access = otp_cookies[0].split("=", 1)[1].split(";", 1)[0]
+        otp_me = auth_routes.current_user(make_request(cookies={"beevolve_access": otp_access}), self.conn)
+        self.assertTrue(otp_me["authenticated"])
 
         # Login sets HttpOnly cookies
         login_res = Response()
@@ -756,19 +784,24 @@ class TestBeEvolvePostgresBackend(unittest.TestCase):
         self.assertIn(("google", "google-sub-123"), self.store.oauth_accounts)
         uid = self.store.oauth_accounts[("google", "google-sub-123")]["user_id"]
 
-        # Create Razorpay order with SAVE20 coupon (49900 -> 39920)
+        # Plans endpoint reflects live DB amount (100 paise -> Rs. 1) and DB changes immediately
+        catalog = sub_routes.list_active_plans(conn=self.conn)
+        self.assertEqual(catalog["plans"][0]["amount_paise"], 100)
+        self.assertEqual(catalog["plans"][0]["amount_rupees"], 1)
+
+        # Create Razorpay order with SAVE20 coupon (100 -> 80)
         with patch.object(payment_routes, "client") as mock_rzp:
-            mock_rzp.order.create.return_value = {"id": "order_rzp_1", "amount": 39920, "currency": "INR"}
+            mock_rzp.order.create.return_value = {"id": "order_rzp_1", "amount": 80, "currency": "INR"}
             order_resp = payment_routes.create_order(
                 payment_routes.OrderRequest(service="Career Toolkit", coupon_code="SAVE20"),
                 user_id=uid,
                 conn=self.conn,
             )
-            self.assertEqual(order_resp["amount"], 39920)
+            self.assertEqual(order_resp["amount"], 80)
 
             mock_rzp.payment.fetch.return_value = {
                 "order_id": "order_rzp_1",
-                "amount": 39920,
+                "amount": 80,
                 "status": "captured",
                 "method": "upi",
             }
@@ -791,6 +824,11 @@ class TestBeEvolvePostgresBackend(unittest.TestCase):
         prod_id = subs["subscriptions"][0]["product_id"]
         access = sub_routes.check_product_access(uuid.UUID(prod_id), user_id=uid, conn=self.conn)
         self.assertTrue(access["has_access"])
+
+        # Updating price in DB immediately reflects in /api/subscriptions/plans
+        self.store.plans["61af1c9e-ba0f-4a83-ac8d-e95773a13b04"]["amount"] = 250
+        updated_catalog = sub_routes.list_active_plans(conn=self.conn)
+        self.assertEqual(updated_catalog["plans"][0]["amount_rupees"], 2.5)
 
         # Webhook dispatch handles autopay NoDataFound & subscription.cancelled cleanly
         webhook_routes.dispatch_event(

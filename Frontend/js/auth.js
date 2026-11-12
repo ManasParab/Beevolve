@@ -780,28 +780,29 @@ function normalizeMobile(value) {
 
       showMessage(
         result.message ||
-          "Email verified successfully.",
+          "Email verified! Signing you in…",
         "success"
       );
 
 
       // --------------------------------------------------------
-      // Move user to login
+      // Direct login -> redirect to dashboard (or fallback login)
       // --------------------------------------------------------
 
       setTimeout(() => {
 
-        setMode("login");
-
-
-        if ($("login-email")) {
-
-          $("login-email").value =
-            pendingSignup.email;
+        if (result.authenticated) {
+          window.location.href = "dashboard.html";
+          return;
         }
 
+        setMode("login");
 
-      }, 800);
+        if ($("login-email")) {
+          $("login-email").value = pendingSignup.email;
+        }
+
+      }, 700);
 
 
     } catch (error) {
@@ -1457,7 +1458,7 @@ function normalizeMobile(value) {
 
 
         if (!email) {
-
+          $("login-email")?.focus();
           return showMessage(
             "Enter your email first, then click Forgot password.",
             "error"
@@ -1547,42 +1548,6 @@ function normalizeMobile(value) {
 
         }
       );
-
-    });
-
-
-  // Microsoft
-  document
-    .querySelectorAll(".social-btn")
-    .forEach((button) => {
-
-      if (
-        button.classList.contains(
-          "social-google"
-        )
-      ) {
-        return;
-      }
-
-
-      if (
-        button.textContent
-          .toLowerCase()
-          .includes("microsoft")
-      ) {
-
-        button.addEventListener(
-          "click",
-          (e) => {
-
-            e.preventDefault();
-
-            startOAuth("microsoft");
-
-          }
-        );
-
-      }
 
     });
 

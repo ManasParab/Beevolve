@@ -56,7 +56,7 @@
     <h1 id="service-name">Career Toolkit</h1>
     <p>Complete your Beevolve purchase in the Razorpay test environment.</p>
     
-<div id="service-price" class="checkout-price">Rs. 499</div>
+<div id="service-price" class="checkout-price">Loading price...</div>
 
 <label class="autopay-option" for="enable-autopay">
   <input type="checkbox" id="enable-autopay">
@@ -69,7 +69,7 @@
   </span>
 </label>
 
-<button id="pay-button" class="btn-primary" type="button">
+<button id="pay-button" class="btn-primary" type="button" disabled>
   Continue to payment
   <span aria-hidden="true">-&gt;</span>
 </button>
@@ -78,24 +78,49 @@
   </section></main>
   <script>
     const API_BASE = "http://127.0.0.1:8000";
-    const SERVICE_PRICES = {"Career Toolkit": 499, "Portfolio Review": 299, "Career Roadmap": 199};
     const params = new URLSearchParams(window.location.search);
-    const service = params.get("service") || "Career Toolkit";
-    const amount = SERVICE_PRICES[service];
+    let service = params.get("service") || "Career Toolkit";
+    let planId = params.get("plan_id");
     const button = document.getElementById("pay-button");
+    const autopayCheckbox = document.getElementById("enable-autopay");
 
-    if (!amount) {
-      document.getElementById("service-name").textContent = "Service unavailable";
-      document.getElementById("service-price").textContent = "Please return to services and choose a valid option.";
-      button.disabled = true;
-    } else {
-      document.getElementById("service-name").textContent = service;
-      document.getElementById("service-price").textContent = `Rs. ${amount}`;
+    document.getElementById("service-name").textContent = service;
+
+    async function loadCheckoutPlan() {
+      try {
+        const response = await fetch(`${API_BASE}/api/subscriptions/plans`, {
+          cache: "no-store"
+        });
+        if (!response.ok) {
+          throw new Error("Unable to load live price from database.");
+        }
+        const data = await response.json();
+        const plans = data.plans || [];
+        const matched = plans.find(
+          p =>
+            (planId && p.plan_id === planId) ||
+            String(p.name).toLowerCase() === String(service).toLowerCase()
+        );
+
+        if (!matched) {
+          document.getElementById("service-name").textContent = "Service unavailable";
+          document.getElementById("service-price").textContent = "Please return to services and choose a valid option.";
+          button.disabled = true;
+          return;
+        }
+
+        service = matched.name;
+        planId = matched.plan_id;
+        document.getElementById("service-name").textContent = matched.name;
+        document.getElementById("service-price").textContent = `Rs. ${matched.amount_rupees}`;
+        button.disabled = false;
+      } catch (error) {
+        document.getElementById("service-price").textContent = "Unable to load live price from server.";
+        button.disabled = true;
+      }
     }
 
-    
-  const autopayCheckbox = document.getElementById("enable-autopay");
-  const planId = params.get("plan_id");
+    loadCheckoutPlan();
 
   button.addEventListener("click", async () => {
     button.disabled = true;

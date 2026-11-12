@@ -38,6 +38,59 @@ def _parse_optional_uuid(raw_value: str | None) -> str | None:
         return None
 
 
+@router.get("/plans")
+def list_active_plans(conn: psycopg.Connection = Depends(get_db)):
+    """Return active service plans and live pricing directly from PostgreSQL."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT pl.id AS plan_id,
+                   pl.product_id,
+                   pr.slug,
+                   pr.name,
+                   pr.category,
+                   pl.plan_interval,
+                   pl.duration_days,
+                   pl.amount AS amount_paise,
+                   pl.currency,
+                   pl.provider_plan_id
+              FROM public.mst_plan pl
+              JOIN public.mst_product pr ON pr.id = pl.product_id
+             WHERE pl.status = 'active'
+               AND pr.status = 'active'
+               AND pr.is_active = TRUE
+             ORDER BY pl.created_date ASC
+            """
+        )
+        rows = cur.fetchall()
+
+    plans = []
+    for row in rows:
+        amount_paise = int(row["amount_paise"])
+        amount_rupees = (
+            amount_paise // 100
+            if amount_paise % 100 == 0
+            else round(amount_paise / 100, 2)
+        )
+        plans.append(
+            {
+                "plan_id": str(row["plan_id"]),
+                "product_id": str(row["product_id"]),
+                "slug": row["slug"],
+                "name": row["name"],
+                "category": row["category"],
+                "plan_interval": row["plan_interval"],
+                "duration_days": int(row["duration_days"]),
+                "amount_paise": amount_paise,
+                "amount_rupees": amount_rupees,
+                "currency": row["currency"],
+                "autopay_enabled": bool(row.get("provider_plan_id")),
+            }
+        )
+
+    return {"plans": plans}
+
+
 @router.post("/create")
 def create_subscription(
     data: SubscriptionRequest,
