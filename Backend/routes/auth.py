@@ -1294,6 +1294,7 @@ def profile(
     }
 
 
+
 @router.put("/profile")
 def update_profile(
     data: UpdateProfileRequest,
@@ -1301,6 +1302,7 @@ def update_profile(
     conn: psycopg.Connection = Depends(get_db),
 ):
     """Update the authenticated user's profile in PostgreSQL."""
+
     normalized_email = str(data.email).strip().lower()
     full_name = data.full_name.strip()
 
@@ -1313,28 +1315,39 @@ def update_profile(
         ) from exc
 
     with conn.cursor() as cur:
+        # Check whether another user already uses this email or mobile.
         cur.execute(
             """
             SELECT id, email, mobile
               FROM public.users
              WHERE id <> %s
-               AND (LOWER(email) = LOWER(%s) OR (%s IS NOT NULL AND mobile = %s))
+               AND (
+                    LOWER(email) = LOWER(%s)
+                    OR (
+                        %s::text IS NOT NULL
+                        AND mobile = %s::text
+                    )
+               )
              LIMIT 1
             """,
             (user_id, normalized_email, mobile, mobile),
         )
+
         conflict = cur.fetchone()
+
         if conflict:
             if str(conflict["email"]).lower() == normalized_email:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="That email address is already in use.",
                 )
+
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="That mobile number is already in use.",
             )
 
+        # Update the user's profile.
         cur.execute(
             """
             UPDATE public.users
@@ -1347,7 +1360,14 @@ def update_profile(
             """,
             (normalized_email, full_name, mobile, user_id),
         )
+
         updated = cur.fetchone()
+
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User profile not found.",
+        )
 
     _log_activity(conn, user_id, "profile_updated", entity_id=user_id)
     conn.commit()
@@ -1362,7 +1382,13 @@ def update_profile(
             "mobile": updated["mobile"],
             "role": updated["role"],
             "email_verified": updated["email_verified"],
-            "created_at": updated["created_at"].isoformat() if updated["created_at"] else None,
-            "updated_at": updated["updated_at"].isoformat() if updated["updated_at"] else None,
+            "created_at": (
+                updated["created_at"].isoformat()
+                if updated["created_at"] else None
+            ),
+            "updated_at": (
+                updated["updated_at"].isoformat()
+                if updated["updated_at"] else None
+            ),
         },
     }
