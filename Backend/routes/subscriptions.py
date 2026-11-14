@@ -6,6 +6,7 @@ import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+import _pg_bootstrap  # noqa: F401
 import psycopg
 from pydantic import BaseModel
 import razorpay

@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import _pg_bootstrap  # noqa: F401
 import psycopg
 
 from config import settings

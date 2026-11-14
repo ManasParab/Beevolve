@@ -15,6 +15,7 @@ from fastapi.responses import RedirectResponse
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 import httpx
+import _pg_bootstrap  # noqa: F401
 import psycopg
 from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, EmailStr, Field

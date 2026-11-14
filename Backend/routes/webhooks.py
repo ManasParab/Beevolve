@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
+import _pg_bootstrap  # noqa: F401
 import psycopg
 from psycopg.errors import NoDataFound
 

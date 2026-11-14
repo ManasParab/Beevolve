@@ -30,6 +30,7 @@ os.environ.setdefault("SMTP_USERNAME", "noreply@example.com")
 os.environ.setdefault("SMTP_PASSWORD", "dummy-smtp-password")
 os.environ.setdefault("EMAIL_OTP_PEPPER", "dummy-otp-pepper")
 
+import _pg_bootstrap  # noqa: F401
 import psycopg  # noqa: E402
 from psycopg.errors import NoDataFound  # noqa: E402
 

@@ -6,17 +6,9 @@ import os
 
 from fastapi import HTTPException, status
 
-# On Windows, help pure-Python psycopg locate PostgreSQL's libpq.dll automatically
-# without triggering Application Control blocks on bundled binary wheels.
-if os.name == "nt":
-    for pg_bin in sorted(glob.glob(r"C:\Program Files\PostgreSQL\*\bin"), reverse=True):
-        if os.path.isdir(pg_bin):
-            os.environ["PATH"] = pg_bin + os.pathsep + os.environ.get("PATH", "")
-            if hasattr(os, "add_dll_directory"):
-                os.add_dll_directory(pg_bin)
-
-import psycopg  # noqa: E402
-from psycopg.rows import dict_row  # noqa: E402
+import _pg_bootstrap  # noqa: F401
+import psycopg
+from psycopg.rows import dict_row
 
 from config import settings  # noqa: E402
 

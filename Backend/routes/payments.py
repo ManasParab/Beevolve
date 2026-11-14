@@ -5,6 +5,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+import _pg_bootstrap  # noqa: F401
 import psycopg
 from pydantic import BaseModel, Field
 import razorpay
